@@ -176,6 +176,15 @@ closed and halt the drain.
   filters.
 - Structured JSON logging (`slog`), `/healthz` and `/readyz` (readiness pings
   PostgreSQL), request-size limits and server timeouts.
+- OpenTelemetry instrumentation (`internal/telemetry`): a per-request server
+  span renamed to the matched route pattern, request count/duration histograms
+  served on `GET /metrics`, and span attributes for ticket state transitions
+  and operator scope. Tracing is **disabled by default** with an explicit
+  no-op tracer and a startup log line; setting `OTEL_EXPORTER_OTLP_ENDPOINT`
+  (`host:port`) enables OTLP gRPC export. Telemetry configuration fails closed
+  on malformed or contradictory values (`OTEL_SDK_DISABLED`,
+  `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_SERVICE_NAME` are also honoured).
+  Metrics are local-only and served from a private Prometheus registry.
 - No secrets in code; all configuration is environment-injected and validated
   at startup.
 

@@ -13,9 +13,12 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/auth"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
 
@@ -80,10 +83,11 @@ type Server struct {
 	logger    *slog.Logger
 	readiness func(ctx context.Context) error
 	mux       *http.ServeMux
+	handler   http.Handler
 }
 
-// NewServer fails closed on any missing dependency.
-func NewServer(authenticator auth.Authenticator, tickets TicketService, operator OperatorStore, manifests ManifestSource, manifestSalt string, completenessKPI float64, logger *slog.Logger, readiness func(ctx context.Context) error) (*Server, error) {
+// NewServer fails closed on any missing dependency, telemetry included.
+func NewServer(authenticator auth.Authenticator, tickets TicketService, operator OperatorStore, manifests ManifestSource, manifestSalt string, completenessKPI float64, logger *slog.Logger, readiness func(ctx context.Context) error, pipeline *telemetry.Telemetry) (*Server, error) {
 	if authenticator == nil || tickets == nil || operator == nil || manifests == nil {
 		return nil, errors.New("authenticator, ticket service, operator store and manifest store are required")
 	}
@@ -99,12 +103,17 @@ func NewServer(authenticator auth.Authenticator, tickets TicketService, operator
 	if readiness == nil {
 		return nil, errors.New("readiness probe is required (fail-closed)")
 	}
+	if pipeline == nil {
+		return nil, errors.New("telemetry pipeline is required (fail-closed); use telemetry.Setup with a disabled config for no-op tracing")
+	}
 	server := &Server{
 		tickets: tickets, operator: operator, manifests: manifests,
 		salt: manifestSalt, kpi: completenessKPI, logger: logger, readiness: readiness,
 		mux: http.NewServeMux(),
 	}
 	server.routes(authenticator)
+	server.mux.Handle("GET /metrics", pipeline.MetricsHandler())
+	server.handler = pipeline.Middleware(server.mux)
 	return server, nil
 }
 
@@ -139,7 +148,7 @@ func (server *Server) routes(authenticator auth.Authenticator) {
 
 // ServeHTTP implements http.Handler.
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	server.mux.ServeHTTP(writer, request)
+	server.handler.ServeHTTP(writer, request)
 }
 
 func (server *Server) healthz(writer http.ResponseWriter, _ *http.Request) {
@@ -183,6 +192,7 @@ func operatorScope(writer http.ResponseWriter, request *http.Request) (string, b
 		writeError(writer, http.StatusForbidden, "operator scope is required")
 		return "", false
 	}
+	trace.SpanFromContext(request.Context()).SetAttributes(attribute.String("ferry.operator_id", resolved.OperatorID))
 	return resolved.OperatorID, true
 }
 

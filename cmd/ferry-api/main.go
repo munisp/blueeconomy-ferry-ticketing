@@ -23,6 +23,7 @@ import (
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/httpapi"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
 
@@ -42,6 +43,27 @@ func run(logger *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	telemetryConfig, err := telemetry.LoadConfig("blueeconomy-ferry-ticketing")
+	if err != nil {
+		return fmt.Errorf("load telemetry config: %w", err)
+	}
+	pipeline, err := telemetry.Setup(ctx, telemetryConfig)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := pipeline.Shutdown(shutdownCtx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err.Error())
+		}
+	}()
+	if pipeline.Enabled() {
+		logger.Info("telemetry enabled", "otlp_endpoint", telemetryConfig.Endpoint, "metrics", "GET /metrics")
+	} else {
+		logger.Info("telemetry tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set); explicit no-op tracer active, Prometheus metrics on GET /metrics")
+	}
 
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -110,7 +132,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	server, err := httpapi.NewServer(authenticator, ticketService, ticketStore, manifestStore, cfg.ManifestSalt, cfg.CompletenessKPI, logger,
-		func(ctx context.Context) error { return pool.Ping(ctx) })
+		func(ctx context.Context) error { return pool.Ping(ctx) }, pipeline)
 	if err != nil {
 		return err
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/auth"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
 
@@ -167,10 +168,24 @@ func newTestServer(t *testing.T) (*Server, *fakeTicketService, *fakeOperatorStor
 		},
 	}
 	manifests := &fakeManifestStore{tickets: []ticketing.Ticket{tickets.ticket}}
+	pipeline, err := telemetry.Setup(context.Background(), telemetry.Config{ServiceName: "ferry-httpapi-test"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pipeline.Shutdown(context.Background()) })
 	server, err := NewServer(headerAuthenticator{}, tickets, operator, manifests, "0123456789abcdef", 0.95, nil,
-		func(context.Context) error { return nil })
+		func(context.Context) error { return nil }, pipeline)
 	require.NoError(t, err)
 	return server, tickets, operator, manifests
+}
+
+// TestServerFailsClosedWithoutTelemetry pins the telemetry dependency as
+// required, mirroring the other fail-closed constructor checks.
+func TestServerFailsClosedWithoutTelemetry(t *testing.T) {
+	tickets := &fakeTicketService{}
+	operator := &fakeOperatorStore{}
+	manifests := &fakeManifestStore{}
+	_, err := NewServer(headerAuthenticator{}, tickets, operator, manifests, "0123456789abcdef", 0.95, nil,
+		func(context.Context) error { return nil }, nil)
+	require.Error(t, err)
 }
 
 // withAuth attaches the test identity headers the headerAuthenticator reads.

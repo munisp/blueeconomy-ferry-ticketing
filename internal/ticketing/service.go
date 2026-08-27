@@ -7,7 +7,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// traceTicketTransition annotates the active request span (when any) with the
+// approved booking state transition. With the no-op tracer this is a no-op.
+func traceTicketTransition(ctx context.Context, ticket Ticket, to State) {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String("ferry.ticket_id", ticket.TicketID),
+		attribute.String("ferry.ticket.transition.from", string(ticket.State)),
+		attribute.String("ferry.ticket.transition.to", string(to)),
+	)
+}
 
 // Event is one transactional-outbox record written atomically with the domain
 // change that produced it.
@@ -223,6 +235,7 @@ func (service *Service) Refund(ctx context.Context, ticketID, principal, princip
 	if !ValidTransition(ticket.State, StateRefunded) {
 		return Ticket{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, ticket.State, StateRefunded)
 	}
+	traceTicketTransition(ctx, ticket, StateRefunded)
 	refundID, err := service.ledger.Refund(ctx, ticket.TicketID, ticket.FareNGNMinor)
 	if err != nil {
 		return Ticket{}, fmt.Errorf("refund fare on ledger: %w", err)
@@ -273,6 +286,7 @@ func (service *Service) terminal(ctx context.Context, ticketID string, to State,
 	if !ValidTransition(ticket.State, to) {
 		return Ticket{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, ticket.State, to)
 	}
+	traceTicketTransition(ctx, ticket, to)
 	return service.store.Transition(ctx, ticketID, ticket.Version, to, Event{
 		EventID:       uuid.NewString(),
 		Topic:         TopicTicketing,
