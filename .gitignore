@@ -1,0 +1,12 @@
+# Binaries and local build output
+/out/
+*.test
+
+# Local environment and secrets
+.env
+*.local
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/

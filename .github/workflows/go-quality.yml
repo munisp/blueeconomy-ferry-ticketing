@@ -1,0 +1,40 @@
+name: Go Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify module graph
+        run: go mod download
+      - name: Enforce formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l $(find . -type f -name '*.go' -not -path './vendor/*'))
+          test -z "$unformatted" || { printf '%s\n' "$unformatted"; exit 1; }
+      - name: Run static analysis
+        run: go vet ./...
+      - name: Run race-enabled tests
+        run: go test -race ./...
+      - name: Build all packages
+        run: go build ./...
