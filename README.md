@@ -226,3 +226,25 @@ PostgreSQL, Kafka and TigerBeetle are behind interfaces; unit tests use
 fakes and the Temporal testsuite, so the full suite runs without external
 services. The Dockerfile builds per-command distroless non-root images
 (`ferry-api`, `ferry-worker`, `outbox-publisher` targets).
+
+### Integration tests
+
+The `-tags integration` suite exercises the production PostgreSQL store
+(capacity enforcement under row locks, idempotent purchase, transactional
+outbox) and the outbox drain end to end against a real Kafka broker. All
+images are digest-pinned. Locally:
+
+```sh
+docker compose -f integration/compose.yaml up -d --wait
+FERRY_TEST_DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55437/blueeconomy_ferries?sslmode=disable' \
+FERRY_TEST_KAFKA_BROKERS='127.0.0.1:9092' \
+  go test -tags integration -race -count=1 ./internal/...
+docker compose -f integration/compose.yaml down -v
+```
+
+The suite fails closed when `FERRY_TEST_DATABASE_URL` or
+`FERRY_TEST_KAFKA_BROKERS` is absent — it never silently skips. CI
+(`.github/workflows/integration.yml`) runs it on every pull request with a
+digest-pinned PostgreSQL `services:` container plus the pinned Kafka service
+from `integration/compose.yaml`, and uploads service logs as artifacts on
+failure.

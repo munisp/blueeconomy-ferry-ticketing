@@ -1,0 +1,73 @@
+name: Live Integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-kafka-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+        env:
+          POSTGRES_DB: blueeconomy_ferries
+          POSTGRES_USER: blueeconomy
+          POSTGRES_PASSWORD: local-only-integration-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blueeconomy -d blueeconomy_ferries"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      FERRY_TEST_DATABASE_URL: postgres://blueeconomy:local-only-integration-password@127.0.0.1:5432/blueeconomy_ferries?sslmode=disable
+      FERRY_TEST_KAFKA_BROKERS: 127.0.0.1:9092
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start the pinned single-broker Kafka
+        run: docker compose -f integration/compose.yaml up -d --wait kafka
+      - name: Run integration tests against live PostgreSQL and Kafka
+        run: go test -tags integration -race -count=1 ./internal/...
+      - name: Capture service logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p integration-logs
+          docker ps -a > integration-logs/docker-ps.txt 2>&1 || true
+          for container in $(docker ps -aq); do
+            name=$(docker inspect --format '{{.Name}}' "$container" | tr -d '/')
+            docker logs "$container" > "integration-logs/${name}.log" 2>&1 || true
+          done
+      - name: Upload integration logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: postgres-kafka-integration-logs
+          path: integration-logs/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Stop integration services
+        if: always()
+        run: docker compose -f integration/compose.yaml down -v --remove-orphans
+
+# Temporal workflow coverage (internal/workflow) uses the in-memory Temporal
+# test environment and needs no server; TigerBeetle ledger access stays behind
+# the ticketing.Ledger interface with fail-closed fakes in unit tests.
