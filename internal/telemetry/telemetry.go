@@ -181,6 +181,12 @@ func (telemetry *Telemetry) Enabled() bool {
 	return telemetry.config.Enabled
 }
 
+// Tracer returns the service tracer: the OTLP-backed SDK tracer when enabled,
+// otherwise the explicit no-op tracer.
+func (telemetry *Telemetry) Tracer() trace.Tracer {
+	return telemetry.tracer
+}
+
 // MetricsHandler serves the Prometheus scrape endpoint.
 func (telemetry *Telemetry) MetricsHandler() http.Handler {
 	return telemetry.metricsHandler
