@@ -2,13 +2,39 @@ package outbox
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 )
+
+// testSigner returns a throwaway provenance signer for envelope tests.
+func testSigner(t *testing.T) *provenance.Signer {
+	t.Helper()
+	_, private, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	signer, err := provenance.NewSigner(SigningKeyID, private)
+	require.NoError(t, err)
+	return signer
+}
+
+// requireValidSignature verifies the envelope provenance signature against
+// the signer's public key, binding it to the exact signed document.
+func requireValidSignature(t *testing.T, signer *provenance.Signer, envelope Envelope) {
+	t.Helper()
+	require.NotEmpty(t, envelope.Provenance.Signature)
+	directory, err := provenance.ParseDirectory([]byte(fmt.Sprintf(`{%q:%q}`, signer.KeyID(), signer.PublicKey())))
+	require.NoError(t, err)
+	raw, err := json.Marshal(envelope)
+	require.NoError(t, err)
+	require.NoError(t, directory.VerifyEnvelope(raw), "provenance signature must verify over the sealed envelope")
+}
 
 func ticketingEvent() Event {
 	return Event{
@@ -29,7 +55,8 @@ func ticketingEvent() Event {
 }
 
 func TestBuildEnvelopeMatchesPlatformContract(t *testing.T) {
-	envelope, err := BuildEnvelope(ticketingEvent())
+	signer := testSigner(t)
+	envelope, err := BuildEnvelope(ticketingEvent(), signer)
 	require.NoError(t, err)
 	require.Equal(t, "1.0", envelope.EnvelopeVersion)
 	require.Equal(t, "event-1", envelope.EventID)
@@ -44,7 +71,7 @@ func TestBuildEnvelopeMatchesPlatformContract(t *testing.T) {
 	require.Equal(t, "keycloak-sub-1", envelope.Provenance.PrincipalID)
 	require.Equal(t, "passenger", envelope.Provenance.PrincipalRole)
 	require.Equal(t, "abc123", envelope.Provenance.LedgerCommitHash)
-	require.Len(t, envelope.Provenance.Signature, 64, "sha256 content digest")
+	requireValidSignature(t, signer, envelope)
 
 	resource, ok := envelope.FHIR.Entry[0].Resource.(map[string]any)
 	require.True(t, ok)
@@ -55,22 +82,22 @@ func TestBuildEnvelopeMatchesPlatformContract(t *testing.T) {
 func TestBuildEnvelopeFailsClosed(t *testing.T) {
 	missing := ticketingEvent()
 	missing.EventID = ""
-	_, err := BuildEnvelope(missing)
+	_, err := BuildEnvelope(missing, testSigner(t))
 	require.Error(t, err)
 
 	unknownType := ticketingEvent()
 	unknownType.EventType = "ferry.ticket.teleported"
-	_, err = BuildEnvelope(unknownType)
+	_, err = BuildEnvelope(unknownType, testSigner(t))
 	require.Error(t, err)
 
 	unknownTopic := ticketingEvent()
 	unknownTopic.Topic = "ferries.debug.v1"
-	_, err = BuildEnvelope(unknownTopic)
+	_, err = BuildEnvelope(unknownTopic, testSigner(t))
 	require.Error(t, err)
 
 	badPayload := ticketingEvent()
 	badPayload.Payload = json.RawMessage(`[1,2]`)
-	_, err = BuildEnvelope(badPayload)
+	_, err = BuildEnvelope(badPayload, testSigner(t))
 	require.Error(t, err)
 }
 
@@ -81,7 +108,7 @@ func TestBuildEnvelopeFraudTelemetry(t *testing.T) {
 	failed := ticketingEvent()
 	failed.EventType = "ferry.ticket.verification_failed"
 	failed.Payload = json.RawMessage(`{"ticket_id": "ticket-1", "principal_id": "gate-1", "artifact_kid": "ab12", "reason": "invalid_signature"}`)
-	envelope, err := BuildEnvelope(failed)
+	envelope, err := BuildEnvelope(failed, testSigner(t))
 	require.NoError(t, err)
 	require.Equal(t, "ferries.ticketing.ticket_verification_failed.v1", envelope.EventType)
 	require.Equal(t, "CONFIDENTIAL", envelope.Classification)
@@ -90,7 +117,7 @@ func TestBuildEnvelopeFraudTelemetry(t *testing.T) {
 	duplicate := ticketingEvent()
 	duplicate.EventType = "ferry.ticket.duplicate_presentation"
 	duplicate.Payload = json.RawMessage(`{"ticket_id": "ticket-1", "principal_id": "gate-2", "first_boarded_by": "gate-1"}`)
-	envelope, err = BuildEnvelope(duplicate)
+	envelope, err = BuildEnvelope(duplicate, testSigner(t))
 	require.NoError(t, err)
 	require.Equal(t, "ferries.ticketing.ticket_duplicate_presentation.v1", envelope.EventType)
 	require.Equal(t, "CONFIDENTIAL", envelope.Classification)
@@ -145,7 +172,7 @@ func TestDrainPublishesWithIdempotentKeys(t *testing.T) {
 		"ferries.ticketing.v1": ticketingProducer,
 		"ferries.manifest.v1":  manifestProducer,
 	}
-	published, err := Drain(context.Background(), source, router, 10)
+	published, err := Drain(context.Background(), source, router, testSigner(t), 10)
 	require.NoError(t, err)
 	require.Equal(t, 2, published)
 	require.Equal(t, []string{"event-1", "event-2"}, source.published)
@@ -160,7 +187,7 @@ func TestDrainAbortsFailClosedOnPublishFailure(t *testing.T) {
 	source := &fakeSource{events: []Event{ticketingEvent()}}
 	producer := &fakeProducer{err: errors.New("kafka unreachable")}
 	router := MapRouter{"ferries.ticketing.v1": producer}
-	published, err := Drain(context.Background(), source, router, 10)
+	published, err := Drain(context.Background(), source, router, testSigner(t), 10)
 	require.Error(t, err)
 	require.Equal(t, 0, published)
 	require.Empty(t, source.published, "never mark published before the broker accepts")
@@ -168,17 +195,17 @@ func TestDrainAbortsFailClosedOnPublishFailure(t *testing.T) {
 
 func TestDrainFailsClosedOnUnknownTopicRoute(t *testing.T) {
 	source := &fakeSource{events: []Event{ticketingEvent()}}
-	published, err := Drain(context.Background(), source, MapRouter{}, 10)
+	published, err := Drain(context.Background(), source, MapRouter{}, testSigner(t), 10)
 	require.Error(t, err)
 	require.Equal(t, 0, published)
 }
 
 func TestDrainValidatesDependencies(t *testing.T) {
-	_, err := Drain(context.Background(), nil, MapRouter{}, 10)
+	_, err := Drain(context.Background(), nil, MapRouter{}, testSigner(t), 10)
 	require.Error(t, err)
-	_, err = Drain(context.Background(), &fakeSource{}, nil, 10)
+	_, err = Drain(context.Background(), &fakeSource{}, nil, testSigner(t), 10)
 	require.Error(t, err)
-	_, err = Drain(context.Background(), &fakeSource{}, MapRouter{}, 0)
+	_, err = Drain(context.Background(), &fakeSource{}, MapRouter{}, testSigner(t), 0)
 	require.Error(t, err)
 }
 

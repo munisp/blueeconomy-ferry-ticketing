@@ -3,13 +3,17 @@
 package outbox
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 )
+
+// SigningKeyID is the provenance key id this producer signs envelopes with;
+// consumers resolve the matching public key from the fleet key directory.
+const SigningKeyID = "ferry-ticketing-1"
 
 const (
 	// EnvelopeVersion is the binding platform envelope version.
@@ -99,9 +103,14 @@ var confidentialEventTypes = map[string]struct{}{
 	"ferry.ticket.duplicate_presentation": {},
 }
 
-// BuildEnvelope maps one outbox event to the platform envelope. It fails
-// closed on unknown event types, unknown topics and malformed payloads.
-func BuildEnvelope(event Event) (Envelope, error) {
+// BuildEnvelope maps one outbox event to the platform envelope and seals it
+// with the fleet provenance signature (JWS EdDSA over the JCS-canonicalized
+// envelope excluding the signature field). It fails closed on a missing
+// signer, unknown event types, unknown topics and malformed payloads.
+func BuildEnvelope(event Event, signer *provenance.Signer) (Envelope, error) {
+	if signer == nil {
+		return Envelope{}, errors.New("provenance signer is required")
+	}
 	if event.EventID == "" || event.SubjectID == "" || event.EventType == "" || len(event.Payload) == 0 {
 		return Envelope{}, errors.New("outbox event identifiers and payload are required")
 	}
@@ -121,7 +130,6 @@ func BuildEnvelope(event Event) (Envelope, error) {
 	}
 	resource["internalEventType"] = event.EventType
 	resource["subjectId"] = event.SubjectID
-	digest := sha256.Sum256(event.Payload)
 	correlationID := event.CorrelationID
 	if correlationID == "" {
 		correlationID = event.EventID
@@ -130,7 +138,7 @@ func BuildEnvelope(event Event) (Envelope, error) {
 	if _, confidential := confidentialEventTypes[event.EventType]; confidential {
 		classification = ClassificationConfidential
 	}
-	return Envelope{
+	envelope := Envelope{
 		EnvelopeVersion: EnvelopeVersion,
 		EventID:         event.EventID,
 		EventType:       eventType,
@@ -145,11 +153,16 @@ func BuildEnvelope(event Event) (Envelope, error) {
 		Provenance: Provenance{
 			PrincipalID:      stringField(resource, "principal_id", "exported_by_principal"),
 			PrincipalRole:    stringField(resource, "principal_role", "state"),
-			Signature:        hex.EncodeToString(digest[:]),
 			LedgerCommitHash: stringField(resource, "ledger_transfer_id", "ledger_post_id", "manifest_digest_sha256"),
 		},
 		Classification: classification,
-	}, nil
+	}
+	signature, err := signer.SignEnvelope(envelope)
+	if err != nil {
+		return Envelope{}, fmt.Errorf("sign envelope provenance for %s: %w", event.EventID, err)
+	}
+	envelope.Provenance.Signature = signature
+	return envelope, nil
 }
 
 func stringField(resource map[string]any, keys ...string) string {

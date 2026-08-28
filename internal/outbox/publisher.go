@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 )
 
 // Producer publishes one keyed message to one topic. Kafka is the production
@@ -43,13 +45,17 @@ func (router MapRouter) ProducerFor(topic string) (Producer, error) {
 // Drain publishes up to batchSize unpublished events at-least-once: an event
 // is marked published only after the producer accepts it, and the idempotent
 // key makes replays safe. Any failure aborts the batch (fail-closed) and
-// returns the count already published.
-func Drain(ctx context.Context, source EventSource, router Router, batchSize int) (int, error) {
+// returns the count already published. Every envelope is sealed with the
+// fleet provenance signature; a missing signer aborts before any publish.
+func Drain(ctx context.Context, source EventSource, router Router, signer *provenance.Signer, batchSize int) (int, error) {
 	if source == nil {
 		return 0, errors.New("outbox event source is required")
 	}
 	if router == nil {
 		return 0, errors.New("topic router is required")
+	}
+	if signer == nil {
+		return 0, errors.New("provenance signer is required")
 	}
 	if batchSize <= 0 {
 		return 0, errors.New("batch size must be positive")
@@ -64,7 +70,7 @@ func Drain(ctx context.Context, source EventSource, router Router, batchSize int
 		if err != nil {
 			return published, err
 		}
-		envelope, err := BuildEnvelope(event)
+		envelope, err := BuildEnvelope(event, signer)
 		if err != nil {
 			return published, fmt.Errorf("build envelope for %s: %w", event.EventID, err)
 		}

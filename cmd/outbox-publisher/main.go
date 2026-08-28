@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/outbox"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
 
@@ -37,6 +38,12 @@ func run() error {
 	batch, err := batchEnv("OUTBOX_BATCH_SIZE")
 	if err != nil {
 		return err
+	}
+	// Fail-closed startup: without the producer provenance key no envelope
+	// may leave this service, so the process refuses to run at all.
+	signer, err := provenance.LoadSignerFromEnv(outbox.SigningKeyID)
+	if err != nil {
+		return fmt.Errorf("load provenance signer: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -73,7 +80,7 @@ func run() error {
 
 	log.Printf("outbox-publisher: draining to ferries topics every %s (batch %d)", interval, batch)
 	for {
-		published, err := outbox.Drain(ctx, source, router, batch)
+		published, err := outbox.Drain(ctx, source, router, signer, batch)
 		if err != nil {
 			return fmt.Errorf("drain outbox: %w (published %d before failure)", err, published)
 		}

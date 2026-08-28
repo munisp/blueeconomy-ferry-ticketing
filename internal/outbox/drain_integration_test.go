@@ -4,6 +4,7 @@ package outbox
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,24 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
+
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 )
+
+// integrationSigner builds a throwaway provenance signer; the integration
+// drain path must seal envelopes exactly like production.
+func integrationSigner(t *testing.T) *provenance.Signer {
+	t.Helper()
+	_, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := provenance.NewSigner(SigningKeyID, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer
+}
 
 // TestDrainAgainstLivePostgresAndKafka runs the transactional-outbox drain
 // path end to end against a real PostgreSQL outbox table and a real Kafka
@@ -78,7 +96,7 @@ func TestDrainAgainstLivePostgresAndKafka(t *testing.T) {
 	}
 	router := MapRouter{"ferries.ticketing.v1": producer}
 
-	published, err := Drain(ctx, source, router, 10)
+	published, err := Drain(ctx, source, router, integrationSigner(t), 10)
 	if err != nil {
 		t.Fatalf("drain outbox: %v", err)
 	}
@@ -95,7 +113,7 @@ func TestDrainAgainstLivePostgresAndKafka(t *testing.T) {
 	}
 
 	// A second drain publishes nothing: the event is already marked.
-	again, err := Drain(ctx, source, router, 10)
+	again, err := Drain(ctx, source, router, integrationSigner(t), 10)
 	if err != nil {
 		t.Fatalf("second drain: %v", err)
 	}
