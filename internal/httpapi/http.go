@@ -20,6 +20,7 @@ import (
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketproof"
 )
 
 // Platform roles recognized by this service.
@@ -27,6 +28,7 @@ const (
 	RolePassenger          = "passenger"
 	RoleOperator           = "operator"
 	RoleAgentCashier       = "agent-cashier"
+	RoleGate               = "gate"
 	RoleNIWAOfficer        = "niwa-officer"
 	RoleStateOfficer       = "state-officer"
 	RoleNIMASAObserver     = "nimasa-observer"
@@ -49,6 +51,13 @@ type TicketService interface {
 	Expire(ctx context.Context, ticketID, correlationID string) (ticketing.Ticket, error)
 }
 
+// BoardingService is the signed-artifact mint/verify/embark boundary.
+type BoardingService interface {
+	MintArtifact(ctx context.Context, ticketID string) (ticketing.Artifact, error)
+	VerifyArtifact(ctx context.Context, token, principal, correlationID string) (ticketproof.Payload, error)
+	Embark(ctx context.Context, operatorID, ticketID, artifact, principal, correlationID string) (ticketing.Ticket, error)
+}
+
 // OperatorStore is the operator portal persistence boundary.
 type OperatorStore interface {
 	CreateVessel(ctx context.Context, vessel ticketing.Vessel) error
@@ -61,7 +70,6 @@ type OperatorStore interface {
 	GetTripScoped(ctx context.Context, operatorID, tripID string) (ticketing.Trip, error)
 	GetTrip(ctx context.Context, tripID string) (ticketing.Trip, error)
 	GetTicket(ctx context.Context, ticketID string) (ticketing.Ticket, error)
-	MarkEmbarked(ctx context.Context, operatorID, ticketID string) (ticketing.Ticket, error)
 	Dashboard(ctx context.Context, operatorID string) (ticketing.Dashboard, error)
 }
 
@@ -78,6 +86,7 @@ type Server struct {
 	tickets   TicketService
 	operator  OperatorStore
 	manifests ManifestSource
+	boarding  BoardingService
 	salt      string
 	kpi       float64
 	logger    *slog.Logger
@@ -87,9 +96,12 @@ type Server struct {
 }
 
 // NewServer fails closed on any missing dependency, telemetry included.
-func NewServer(authenticator auth.Authenticator, tickets TicketService, operator OperatorStore, manifests ManifestSource, manifestSalt string, completenessKPI float64, logger *slog.Logger, readiness func(ctx context.Context) error, pipeline *telemetry.Telemetry) (*Server, error) {
+func NewServer(authenticator auth.Authenticator, tickets TicketService, operator OperatorStore, manifests ManifestSource, boarding BoardingService, manifestSalt string, completenessKPI float64, logger *slog.Logger, readiness func(ctx context.Context) error, pipeline *telemetry.Telemetry) (*Server, error) {
 	if authenticator == nil || tickets == nil || operator == nil || manifests == nil {
 		return nil, errors.New("authenticator, ticket service, operator store and manifest store are required")
+	}
+	if boarding == nil {
+		return nil, errors.New("boarding service is required (fail-closed: no unsigned boarding path)")
 	}
 	if len(manifestSalt) < 16 {
 		return nil, errors.New("manifest salt of at least 16 characters is required")
@@ -107,7 +119,7 @@ func NewServer(authenticator auth.Authenticator, tickets TicketService, operator
 		return nil, errors.New("telemetry pipeline is required (fail-closed); use telemetry.Setup with a disabled config for no-op tracing")
 	}
 	server := &Server{
-		tickets: tickets, operator: operator, manifests: manifests,
+		tickets: tickets, operator: operator, manifests: manifests, boarding: boarding,
 		salt: manifestSalt, kpi: completenessKPI, logger: logger, readiness: readiness,
 		mux: http.NewServeMux(),
 	}
@@ -130,6 +142,8 @@ func (server *Server) routes(authenticator auth.Authenticator) {
 		RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleFMMBEOversight))
 	server.mux.Handle("POST /v1/tickets/{id}/refund", protected(http.HandlerFunc(server.refundTicket), RolePassenger, RoleOperator))
 	server.mux.Handle("POST /v1/tickets/{id}/void", protected(http.HandlerFunc(server.voidTicket), RoleOperator, RoleStateOfficer))
+	server.mux.Handle("GET /v1/tickets/{id}/artifact", protected(http.HandlerFunc(server.getTicketArtifact), RolePassenger, RoleAgentCashier, RoleOperator))
+	server.mux.Handle("POST /v1/tickets/verify", protected(http.HandlerFunc(server.verifyTicketArtifact), RoleOperator, RoleGate))
 
 	server.mux.Handle("GET /v1/nimasa/trips/{tripID}/manifest", protected(http.HandlerFunc(server.getManifest),
 		RoleNIWAOfficer, RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleOperator, RoleStateOfficer, RoleFMMBEOversight))
@@ -231,6 +245,10 @@ func writeDomainError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusNotFound, "not found")
 	case errors.Is(err, ticketing.ErrCapacityExceeded):
 		writeError(writer, http.StatusConflict, "trip capacity is fully reserved")
+	case errors.Is(err, ticketing.ErrBoardingAlreadyConsumed):
+		writeError(writer, http.StatusConflict, "BOARDING_ALREADY_CONSUMED")
+	case errors.Is(err, ticketing.ErrTicketProofInvalid):
+		writeError(writer, http.StatusUnauthorized, "ticket artifact verification failed")
 	case errors.Is(err, ticketing.ErrInvalidTransition):
 		writeError(writer, http.StatusConflict, "state transition is not permitted")
 	case errors.Is(err, ticketing.ErrIdempotencyConflict):

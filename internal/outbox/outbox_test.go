@@ -74,6 +74,28 @@ func TestBuildEnvelopeFailsClosed(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestBuildEnvelopeFraudTelemetry pins the security-operations contract:
+// fraud events map to their dedicated envelope types on the ticketing topic
+// with the CONFIDENTIAL classification.
+func TestBuildEnvelopeFraudTelemetry(t *testing.T) {
+	failed := ticketingEvent()
+	failed.EventType = "ferry.ticket.verification_failed"
+	failed.Payload = json.RawMessage(`{"ticket_id": "ticket-1", "principal_id": "gate-1", "artifact_kid": "ab12", "reason": "invalid_signature"}`)
+	envelope, err := BuildEnvelope(failed)
+	require.NoError(t, err)
+	require.Equal(t, "ferries.ticketing.ticket_verification_failed.v1", envelope.EventType)
+	require.Equal(t, "CONFIDENTIAL", envelope.Classification)
+	require.Equal(t, "gate-1", envelope.Provenance.PrincipalID)
+
+	duplicate := ticketingEvent()
+	duplicate.EventType = "ferry.ticket.duplicate_presentation"
+	duplicate.Payload = json.RawMessage(`{"ticket_id": "ticket-1", "principal_id": "gate-2", "first_boarded_by": "gate-1"}`)
+	envelope, err = BuildEnvelope(duplicate)
+	require.NoError(t, err)
+	require.Equal(t, "ferries.ticketing.ticket_duplicate_presentation.v1", envelope.EventType)
+	require.Equal(t, "CONFIDENTIAL", envelope.Classification)
+}
+
 type fakeSource struct {
 	events    []Event
 	published []string

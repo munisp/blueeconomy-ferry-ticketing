@@ -196,19 +196,25 @@ func (store *PostgresStore) Dashboard(ctx context.Context, operatorID string) (D
 	return dashboard, rows.Err()
 }
 
-// MarkEmbarked records a boarded passenger on an operator-scoped ISSUED
-// ticket (manifest completeness input).
-func (store *PostgresStore) MarkEmbarked(ctx context.Context, operatorID, ticketID string) (Ticket, error) {
+// ConsumeBoarding implements the first-scan-wins boarding guard: the UPDATE
+// consumes the boarding exactly once per ticket (boarded_at IS NULL), scoped
+// to the operator and to ISSUED tickets. consumed is false when the row did
+// not match — the caller distinguishes "unknown ticket" from "already
+// consumed" via GetTicket. artifactKid records the key id of the presented
+// artifact (empty on the legacy raw-ticket-id path).
+func (store *PostgresStore) ConsumeBoarding(ctx context.Context, operatorID, ticketID, boardedBy, artifactKid string) (bool, error) {
+	if operatorID == "" || ticketID == "" || boardedBy == "" {
+		return false, errors.New("operator id, ticket id and boarding principal are required")
+	}
 	result, err := store.pool.Exec(ctx,
-		`UPDATE tickets SET embarked = TRUE, updated_at = now()
-		 WHERE ticket_id = $1 AND operator_id = $2 AND state = 'ISSUED'`, ticketID, operatorID)
+		`UPDATE tickets SET embarked = TRUE, boarded_at = now(), boarded_by = $3,
+		        artifact_kid = NULLIF($4, ''), updated_at = now()
+		 WHERE ticket_id = $1 AND operator_id = $2 AND state = 'ISSUED' AND boarded_at IS NULL`,
+		ticketID, operatorID, boardedBy, artifactKid)
 	if err != nil {
-		return Ticket{}, fmt.Errorf("mark embarked: %w", err)
+		return false, fmt.Errorf("consume boarding: %w", err)
 	}
-	if result.RowsAffected() != 1 {
-		return Ticket{}, ErrNotFound
-	}
-	return store.GetTicket(ctx, ticketID)
+	return result.RowsAffected() == 1, nil
 }
 
 // AppendEvent writes one standalone outbox event (workflow activities use it

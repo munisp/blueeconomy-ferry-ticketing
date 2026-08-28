@@ -122,15 +122,27 @@ func (server *Server) voidTicket(writer http.ResponseWriter, request *http.Reque
 }
 
 type ticketViewBody struct {
-	TicketID        string `json:"ticketId"`
-	TripID          string `json:"tripId"`
-	State           string `json:"state"`
-	FareNGNMinor    int64  `json:"fareNgnMinor"`
-	Channel         string `json:"channel"`
-	SeatNumber      *int   `json:"seatNumber,omitempty"`
-	PassengerDigest string `json:"passengerDigestSha256"`
-	CorrelationID   string `json:"correlationId"`
-	Version         int64  `json:"version"`
+	TicketID        string     `json:"ticketId"`
+	TripID          string     `json:"tripId"`
+	State           string     `json:"state"`
+	FareNGNMinor    int64      `json:"fareNgnMinor"`
+	Channel         string     `json:"channel"`
+	SeatNumber      *int       `json:"seatNumber,omitempty"`
+	PassengerDigest string     `json:"passengerDigestSha256"`
+	CorrelationID   string     `json:"correlationId"`
+	Version         int64      `json:"version"`
+	Embarked        bool       `json:"embarked"`
+	BoardedAt       *time.Time `json:"boardedAt,omitempty"`
+	BoardedBy       string     `json:"boardedBy,omitempty"`
+	ArtifactKid     string     `json:"artifactKid,omitempty"`
+}
+
+type embarkRequestBody struct {
+	Artifact string `json:"artifact"`
+}
+
+type verifyRequestBody struct {
+	Artifact string `json:"artifact"`
 }
 
 func ticketView(ticket ticketing.Ticket) ticketViewBody {
@@ -144,6 +156,10 @@ func ticketView(ticket ticketing.Ticket) ticketViewBody {
 		PassengerDigest: ticket.PassengerDigest,
 		CorrelationID:   ticket.CorrelationID,
 		Version:         ticket.Version,
+		Embarked:        ticket.Embarked,
+		BoardedAt:       ticket.BoardedAt,
+		BoardedBy:       ticket.BoardedBy,
+		ArtifactKid:     ticket.ArtifactKid,
 	}
 }
 
@@ -291,12 +307,87 @@ func (server *Server) embarkTicket(writer http.ResponseWriter, request *http.Req
 	if !ok {
 		return
 	}
-	ticket, err := server.operator.MarkEmbarked(request.Context(), operatorID, request.PathValue("id"))
+	resolved, _ := auth.PrincipalFrom(request.Context())
+	// The signed-artifact path is the default; an empty body is the legacy
+	// raw-ticket-id path, retained for backward compatibility.
+	var body embarkRequestBody
+	artifact := ""
+	if request.Body != nil && request.ContentLength != 0 {
+		if !decodeBody(writer, request, &body) {
+			return
+		}
+		artifact = strings.TrimSpace(body.Artifact)
+	}
+	if artifact == "" {
+		server.logger.Warn("legacy raw-ticket-id embark used; migrate gates to signed artifacts",
+			"ticket_id", request.PathValue("id"), "operator_id", operatorID, "correlation_id", correlationID(request))
+	}
+	ticket, err := server.boarding.Embark(request.Context(), operatorID, request.PathValue("id"), artifact, resolved.Subject, correlationID(request))
 	if err != nil {
+		server.logger.Warn("embark rejected", "ticket_id", request.PathValue("id"), "error", err.Error())
 		writeDomainError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, ticketView(ticket))
+}
+
+// getTicketArtifact mints the signed, QR-encodable boarding artifact for an
+// ISSUED ticket. The artifact is a bearer capability: only the purchaser and
+// the owning operator may retrieve it (no oversight roles).
+func (server *Server) getTicketArtifact(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	ticket, err := server.operator.GetTicket(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	owner := ticket.PurchaserPrincipal == resolved.Subject
+	operator := resolved.HasRole(RoleOperator) && resolved.OperatorID != "" && resolved.OperatorID == ticket.OperatorID
+	if !owner && !operator {
+		writeError(writer, http.StatusForbidden, "forbidden")
+		return
+	}
+	artifact, err := server.boarding.MintArtifact(request.Context(), ticket.TicketID)
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, artifact)
+}
+
+// verifyTicketArtifact is the stateless gate check: authenticity (Ed25519
+// signature, trusted kid, rotation grace, expiry) plus the rotating window
+// code. No database read is required for authenticity; failures emit
+// CONFIDENTIAL fraud telemetry and are logged without PII.
+func (server *Server) verifyTicketArtifact(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	var body verifyRequestBody
+	if !decodeBody(writer, request, &body) {
+		return
+	}
+	payload, err := server.boarding.VerifyArtifact(request.Context(), strings.TrimSpace(body.Artifact), resolved.Subject, correlationID(request))
+	if err != nil {
+		server.logger.Warn("ticket artifact verification failed",
+			"reason", strings.TrimPrefix(err.Error(), ticketing.ErrTicketProofInvalid.Error()+": "),
+			"correlation_id", correlationID(request))
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"valid":         true,
+		"ticketId":      payload.TicketID,
+		"tripId":        payload.TripID,
+		"seatNumber":    payload.Seat,
+		"kid":           payload.KeyID,
+		"rotationEpoch": payload.RotationEpoch,
+		"expiresAt":     payload.ExpiresAt,
+	})
 }
 
 func (server *Server) dashboard(writer http.ResponseWriter, request *http.Request) {

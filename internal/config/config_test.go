@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -24,6 +25,8 @@ func validEnv(t *testing.T) {
 	t.Setenv("FERRY_TB_OPERATOR_REVENUE_ACCOUNT", "00000000000000000000000000000002")
 	t.Setenv("FERRY_TB_AGENT_FLOAT_ACCOUNT", "00000000000000000000000000000003")
 	t.Setenv("FERRY_TB_PENDING_TIMEOUT_SECONDS", "900")
+	t.Setenv("FERRY_TICKET_SIGNING_KEY_FILE", "/run/secrets/ticket-signing-key")
+	t.Setenv("FERRY_TICKET_WINDOW_SECRET", "window-secret-0123456789")
 }
 
 func TestLoadValidatesJWTMode(t *testing.T) {
@@ -68,6 +71,53 @@ func TestLoadFailsClosedOnMissingValues(t *testing.T) {
 	t.Setenv("FERRY_OIDC_JWKS_URL", "http://insecure.example/jwks")
 	_, err = Load()
 	require.Error(t, err, "JWKS must be HTTPS")
+}
+
+func TestLoadTicketProofValidation(t *testing.T) {
+	validEnv(t)
+	config, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, "/run/secrets/ticket-signing-key", config.TicketSigningKeyFile)
+	require.Equal(t, uint32(1), config.TicketRotationEpoch, "epoch defaults to 1 on first deployment")
+
+	// No signing key file: fail closed.
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_SIGNING_KEY_FILE", "")
+	_, err = Load()
+	require.Error(t, err)
+
+	// Short window secret: fail closed.
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_WINDOW_SECRET", "short")
+	_, err = Load()
+	require.Error(t, err)
+
+	// Rotation grace requires the previous key file, and vice versa.
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL", "2026-10-01T00:00:00Z")
+	_, err = Load()
+	require.Error(t, err)
+
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE", "/run/secrets/ticket-signing-key-prev")
+	t.Setenv("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL", "")
+	_, err = Load()
+	require.Error(t, err, "previous key without grace deadline fails closed")
+
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE", "/run/secrets/ticket-signing-key-prev")
+	t.Setenv("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL", "not-a-time")
+	_, err = Load()
+	require.Error(t, err)
+
+	validEnv(t)
+	t.Setenv("FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE", "/run/secrets/ticket-signing-key-prev")
+	t.Setenv("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL", "2026-10-01T00:00:00Z")
+	t.Setenv("FERRY_TICKET_ROTATION_EPOCH", "2")
+	config, err = Load()
+	require.NoError(t, err)
+	require.Equal(t, uint32(2), config.TicketRotationEpoch)
+	require.Equal(t, "2026-10-01T00:00:00Z", config.TicketPreviousKeyGraceUntil.Format(time.RFC3339))
 }
 
 func TestLoadTrustedProxyMode(t *testing.T) {

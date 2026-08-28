@@ -117,15 +117,16 @@ func getTicketTx(ctx context.Context, querier interface {
 }, ticketID string) (Ticket, error) {
 	var ticket Ticket
 	var seatNumber *int
-	var agentID, reserveID, postID *string
+	var agentID, reserveID, postID, boardedBy, artifactKid *string
 	err := querier.QueryRow(ctx,
 		`SELECT ticket_id, trip_id, operator_id, passenger_digest_sha256, fare_ngn_minor, channel, state,
 		        version, seat_number, agent_id, ledger_reserve_id, ledger_post_id, purchaser_principal,
-		        correlation_id, embarked, created_at, updated_at
+		        correlation_id, embarked, boarded_at, boarded_by, artifact_kid, created_at, updated_at
 		 FROM tickets WHERE ticket_id = $1`, ticketID).
 		Scan(&ticket.TicketID, &ticket.TripID, &ticket.OperatorID, &ticket.PassengerDigest, &ticket.FareNGNMinor,
 			&ticket.Channel, &ticket.State, &ticket.Version, &seatNumber, &agentID, &reserveID, &postID,
-			&ticket.PurchaserPrincipal, &ticket.CorrelationID, &ticket.Embarked, &ticket.CreatedAt, &ticket.UpdatedAt)
+			&ticket.PurchaserPrincipal, &ticket.CorrelationID, &ticket.Embarked, &ticket.BoardedAt, &boardedBy,
+			&artifactKid, &ticket.CreatedAt, &ticket.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Ticket{}, ErrNotFound
@@ -141,6 +142,12 @@ func getTicketTx(ctx context.Context, querier interface {
 	}
 	if postID != nil {
 		ticket.LedgerPostID = *postID
+	}
+	if boardedBy != nil {
+		ticket.BoardedBy = *boardedBy
+	}
+	if artifactKid != nil {
+		ticket.ArtifactKid = *artifactKid
 	}
 	return ticket, nil
 }

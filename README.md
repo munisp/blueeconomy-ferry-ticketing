@@ -11,6 +11,11 @@ manifests for NIMASA/NIWA oversight, and publishes every state change through
 a transactional outbox onto the `ferries.ticketing.v1` /
 `ferries.manifest.v1` Kafka topics with the platform envelope.
 
+Issued tickets are presented at the gate as **signed artifacts**:
+Ed25519-signed, QR-encodable payloads with a TOTP-style rotating window code
+(anti-screenshot), verified offline against the public key set and consumed
+first-scan-wins in PostgreSQL (see *Signed ticket artifacts* below).
+
 Every boundary is fail-closed: the process refuses to start or serve without
 PostgreSQL, TigerBeetle, the manifest salt, an explicit auth mode and the
 completeness KPI. There are no mock endpoints, synthetic data or default
@@ -23,6 +28,7 @@ credentials.
 | `cmd/ferry-api` | Ticketing, NIMASA manifest and operator portal HTTP API (`/healthz`, `/readyz`). |
 | `cmd/ferry-worker` | Temporal worker hosting `FerryTicketWorkflow` and its activities. |
 | `cmd/outbox-publisher` | Drains the transactional outbox to Kafka, at-least-once with idempotent keys and `RequireAll` acks. |
+| `cmd/ticket-keygen` | One-shot provisioning: generates the Ed25519 ticket signing key file (mode 0600) and prints the public key + kid for verifier distribution. |
 
 ## Ticket lifecycle
 
@@ -42,6 +48,84 @@ credentials.
   to passenger clearing; void releases the pending reserve.
 - Passengers are never stored as raw PII: tickets carry an HMAC-SHA256 salted
   digest (`FERRY_MANIFEST_SALT`) of the tokenized passenger reference.
+
+## Signed ticket artifacts (anti-forgery / anti-counterfeit)
+
+Threat model. A DB record alone does not stop (a) photocopied or screenshotted
+tickets presented at multiple gangways, (b) forged ticket references, or
+(c) double-presentation of one valid ticket. The artifact layer addresses all
+three:
+
+1. **Forgery** — the artifact is Ed25519-signed by the service signing key
+   (env-injected file, `FERRY_TICKET_SIGNING_KEY_FILE`; the service fails
+   closed without it). Authenticity verification is **offline**: a gate or the
+   mobile app needs only the public key set — no network or DB call. The
+   payload binds ticket id, trip id, seat, validity window, the salted holder
+   digest and the signing `kid` + rotation epoch.
+2. **Static screenshots** — the artifact trailer carries a TOTP-style
+   rotating window code: `HMAC-SHA256(window_secret, floor(unix/30))[0:8]`
+   where `window_secret = HMAC-SHA256(FERRY_TICKET_WINDOW_SECRET,
+   "BET1-window" || ticket_id)`. The window secret is derived at verification
+   time, so no per-ticket secret is stored. A 30-second step with ±1 window
+   tolerance caps a screenshot's useful life at ~90 seconds.
+3. **Double-presentation** — embark consumes the boarding atomically in
+   PostgreSQL (`UPDATE tickets … SET boarded_at … WHERE boarded_at IS NULL`).
+   First scan wins; a second presentation at any gangway fails with
+   `409 BOARDING_ALREADY_CONSUMED` and emits a
+   `ferry.ticket.duplicate_presentation` fraud event.
+
+### Wire format v1 (`internal/ticketproof`, pure Go — embeddable offline)
+
+```
+payload (all integers big-endian):
+  magic           4 bytes   "BET1"
+  kid             8 bytes   SHA-256(ed25519 public key)[0:8]
+  ticket_id       u8 length-prefixed UTF-8
+  trip_id         u8 length-prefixed UTF-8
+  seat            u16       (0 = unassigned)
+  issued_at       i64       unix seconds (mint instant)
+  expires_at      i64       unix seconds (trip scheduled departure)
+  rotation_epoch  u32       signing-key epoch, monotonic per rotation
+  holder_digest   32 bytes  raw HMAC-SHA256 salted passenger digest
+artifact = payload || ed25519_signature(payload)[64] || window_code[8]
+token    = base64url-no-pad(artifact)      -- QR alphabet safe
+```
+
+Artifacts are minted on demand by `GET /v1/tickets/{id}/artifact` (owner or
+owning operator only — the artifact is a bearer capability); nothing
+per-ticket is stored. `expires_at` is the trip's scheduled departure, so
+artifacts die with the voyage.
+
+**kid scheme and rotation.** `kid = SHA-256(publicKey)[0:8]`, rendered
+base64url in JSON. Rotation mirrors the maritime-intelligence feed pattern:
+the current key signs at `FERRY_TICKET_ROTATION_EPOCH`; the immediately
+previous key (`FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE`) is accepted until
+`FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL` (RFC3339, required when a previous
+key is configured). Unknown kids, expired grace and epoch mismatches fail
+closed.
+
+**Fraud telemetry.** Invalid signatures, unknown kids, expired rotation
+grace, stale window codes and duplicate presentations emit outbox events on
+`ferries.ticketing.v1` (`ferry.ticket.verification_failed` /
+`ferry.ticket.duplicate_presentation`) that the publisher wraps in the
+platform envelope as `ferries.ticketing.ticket_verification_failed.v1` /
+`ferries.ticketing.ticket_duplicate_presentation.v1` with classification
+**CONFIDENTIAL** for the security-operations engine. Logs carry the failure
+reason, kid and correlation id — never PII.
+
+### Boarding API
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/tickets/{id}/artifact` | Mint the signed artifact (purchaser or owning operator; ISSUED tickets only). |
+| `POST /v1/tickets/verify` | Stateless authenticity + window-code check (`operator`, `gate` roles). `200 {"valid": true, …}` or `401` + fraud event. |
+| `POST /v1/operator/tickets/{id}/embark` | Consume boarding with `{"artifact": "…"}`; first-scan-wins, `409 BOARDING_ALREADY_CONSUMED` on replay. |
+
+The embark body is optional: an empty body is the **legacy** raw-ticket-id
+path, retained for backward compatibility. It goes through the same atomic
+first-scan-wins guard, is logged with a `legacy` warning, and gates should
+migrate to signed artifacts.
+
 
 ## NIMASA manifest API
 
@@ -77,11 +161,13 @@ the service/DB layer, not only at the edge).
 | `GET /v1/operator/vessels`, `GET/PATCH/DELETE /v1/operator/vessels/{id}` | Vessel registry CRUD. Delete fails closed when trips exist. |
 | `POST /v1/operator/trips` | Schedule a departure; capacity is snapshotted from the vessel. |
 | `GET /v1/operator/trips` | List trips. |
-| `POST /v1/operator/tickets/{id}/embark` | Mark an ISSUED ticket boarded. |
+| `POST /v1/operator/tickets/{id}/embark` | Consume boarding first-scan-wins (signed artifact default; legacy raw-id path deprecated). |
 | `GET /v1/operator/dashboard` | Tickets sold, revenue (NGN minor), per-corridor stats, manifest completeness vs KPI. |
 
 Ticketing routes: `POST /v1/tickets` (`passenger`, `agent-cashier`),
 `GET /v1/tickets/{id}` (owner, owning operator, oversight roles),
+`GET /v1/tickets/{id}/artifact` (owner, owning operator),
+`POST /v1/tickets/verify` (`operator`, `gate`),
 `POST /v1/tickets/{id}/refund` (owner or owning operator),
 `POST /v1/tickets/{id}/void` (owning operator or `state-officer`).
 
@@ -131,7 +217,9 @@ FHIR-aligned envelope and publishes to the row's topic:
 
 Delivery is at-least-once; the Kafka message key is the outbox event ID and
 the writer requires all-broker acks. Unknown event types or topics fail
-closed and halt the drain.
+closed and halt the drain. Fraud telemetry (`ferry.ticket.verification_failed`,
+`ferry.ticket.duplicate_presentation`) is classified `CONFIDENTIAL`; all other
+events are `INTERNAL`.
 
 ## Configuration (environment, all required — fail-closed)
 
@@ -151,6 +239,11 @@ closed and halt the drain.
 | `FERRY_TB_LEDGER` / `FERRY_TB_CODE` | TigerBeetle ledger and transfer/account code (non-zero). |
 | `FERRY_TB_PASSENGER_CLEARING_ACCOUNT` / `FERRY_TB_OPERATOR_REVENUE_ACCOUNT` / `FERRY_TB_AGENT_FLOAT_ACCOUNT` | Approved account IDs (hex uint128, distinct, non-zero). |
 | `FERRY_TB_PENDING_TIMEOUT_SECONDS` | Pending reserve timeout (non-zero). |
+| `FERRY_TICKET_SIGNING_KEY_FILE` | Ed25519 private key file (hex or base64 of the 64-byte key or 32-byte seed; inject via secret manager). |
+| `FERRY_TICKET_WINDOW_SECRET` | Server secret for rotating window codes (≥ 16 chars; secret). |
+| `FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE` | Optional previous key, accepted during the rotation grace window. |
+| `FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL` | RFC3339 grace deadline; required when a previous key is configured. |
+| `FERRY_TICKET_ROTATION_EPOCH` | Signing-key epoch (uint32 ≥ 1; default 1, increment per rotation). |
 
 ### `ferry-worker`
 
@@ -170,10 +263,14 @@ closed and halt the drain.
   optional pinned CA. Behind the platform edge, the trusted-proxy mode accepts
   identity headers only from approved CIDRs presenting the approved proxy
   identity header.
-- Role middleware covers `passenger`, `operator`, `agent-cashier`,
+- Role middleware covers `passenger`, `operator`, `agent-cashier`, `gate`,
   `niwa-officer`, `state-officer`, `nimasa-observer`, `independent-auditor`,
   `auditor`, `fmmbe-oversight`; operator tenancy is enforced with DB row
   filters.
+- Ticket boarding artifacts are Ed25519-signed (`internal/ticketproof`) with
+  offline verification, key-rotation grace and rotating window codes; boarding
+  consumption is atomic in PostgreSQL and fraud signals are CONFIDENTIAL
+  outbox events (see *Signed ticket artifacts*).
 - Structured JSON logging (`slog`), `/healthz` and `/readyz` (readiness pings
   PostgreSQL), request-size limits and server timeouts.
 - OpenTelemetry instrumentation (`internal/telemetry`): a per-request server
@@ -193,26 +290,37 @@ closed and halt the drain.
 `db/migrations/0001_ferry_ticketing.sql` creates operators, vessels, trips
 (capacity CHECK + `seats_reserved` guard), tickets (state CHECK, optimistic
 `version`), purchase idempotency keys, cash-in events, manifests and the
-transactional outbox. All queries are parameterized.
+transactional outbox. `db/migrations/0002_signed_tickets.sql` adds the
+first-scan-wins boarding columns (`boarded_at`, `boarded_by`, `artifact_kid`)
+and backfills pre-existing embarked tickets so the guard covers them. All
+queries are parameterized.
 
 ## Runbook
 
-1. Apply `db/migrations/0001_ferry_ticketing.sql` to the service database.
-2. Provision the three TigerBeetle accounts and set the `FERRY_TB_*` env
+1. Apply `db/migrations/0001_ferry_ticketing.sql` and
+   `db/migrations/0002_signed_tickets.sql` to the service database.
+2. Provision the ticket signing key: `ticket-keygen /run/secrets/ticket-signing-key`
+   (or generate externally) and set `FERRY_TICKET_SIGNING_KEY_FILE` +
+   `FERRY_TICKET_WINDOW_SECRET`. Distribute the printed public key/kid to
+   offline verifiers.
+3. Provision the three TigerBeetle accounts and set the `FERRY_TB_*` env
    block; `ferry-api` creates them idempotently at startup
    (`EnsureAccounts`).
-3. Start `ferry-api`, `ferry-worker`, `outbox-publisher` with their env
+4. Start `ferry-api`, `ferry-worker`, `outbox-publisher` with their env
    blocks. All three exit non-zero when a dependency is missing.
-4. Verify `/healthz` (liveness) and `/readyz` (PostgreSQL reachable).
-5. Purchase flow: create operator vessel → schedule trip →
+5. Verify `/healthz` (liveness) and `/readyz` (PostgreSQL reachable).
+6. Purchase flow: create operator vessel → schedule trip →
    `POST /v1/tickets` with `Idempotency-Key` → ticket ISSUED.
-6. Manifest: `POST /v1/operator/trips/{id}/manifest/export`, then NIMASA/NIWA
+7. Boarding: passenger (or operator) fetches `GET /v1/tickets/{id}/artifact`;
+   the gate optionally checks `POST /v1/tickets/verify`, then
+   `POST /v1/operator/tickets/{id}/embark` with `{"artifact": "…"}`.
+8. Manifest: `POST /v1/operator/trips/{id}/manifest/export`, then NIMASA/NIWA
    roles read `GET /v1/nimasa/trips/{id}/manifest`.
-7. Start `FerryTicketWorkflow` per issued ticket (workflow ID: ticket ID);
+9. Start `FerryTicketWorkflow` per issued ticket (workflow ID: ticket ID);
    signal `ferry.manifest-submitted` after export and
    `ferry.telemetry-updated` on AIS/telemetry updates; query `ferry.status`.
-8. The outbox publisher drains continuously; on Kafka outage it exits
-   non-zero and replays safely on restart (idempotent keys).
+10. The outbox publisher drains continuously; on Kafka outage it exits
+    non-zero and replays safely on restart (idempotent keys).
 
 ## Development
 

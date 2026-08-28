@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the validated ferry-api configuration.
@@ -36,6 +37,12 @@ type Config struct {
 	OperatorRevenueAccount        string
 	AgentFloatAccount             string
 	PendingTransferTimeoutSeconds uint32
+
+	TicketSigningKeyFile         string
+	TicketPreviousSigningKeyFile string
+	TicketPreviousKeyGraceUntil  time.Time
+	TicketRotationEpoch          uint32
+	TicketWindowSecret           string
 }
 
 // Load reads and validates the environment, failing closed on any missing or
@@ -116,7 +123,50 @@ func Load() (Config, error) {
 	if config.PendingTransferTimeoutSeconds, err = parseNonZeroUint32("FERRY_TB_PENDING_TIMEOUT_SECONDS"); err != nil {
 		return Config{}, err
 	}
+	if err := config.loadTicketProof(); err != nil {
+		return Config{}, err
+	}
 	return config, nil
+}
+
+// loadTicketProof validates the signed-ticket-artifact configuration. The
+// service fails closed without a signing key file and a window secret; the
+// previous key (rotation grace) is optional but requires a grace deadline.
+func (config *Config) loadTicketProof() error {
+	config.TicketSigningKeyFile = strings.TrimSpace(os.Getenv("FERRY_TICKET_SIGNING_KEY_FILE"))
+	if config.TicketSigningKeyFile == "" {
+		return errors.New("FERRY_TICKET_SIGNING_KEY_FILE is required (fail-closed: no ticket signing without an injected key)")
+	}
+	config.TicketWindowSecret = strings.TrimSpace(os.Getenv("FERRY_TICKET_WINDOW_SECRET"))
+	if len(config.TicketWindowSecret) < 16 {
+		return errors.New("FERRY_TICKET_WINDOW_SECRET is required and must be at least 16 characters")
+	}
+	config.TicketPreviousSigningKeyFile = strings.TrimSpace(os.Getenv("FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE"))
+	grace := strings.TrimSpace(os.Getenv("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL"))
+	if config.TicketPreviousSigningKeyFile != "" {
+		if grace == "" {
+			return errors.New("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL is required when a previous signing key is configured")
+		}
+		deadline, err := time.Parse(time.RFC3339, grace)
+		if err != nil {
+			return fmt.Errorf("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL must be RFC3339: %w", err)
+		}
+		config.TicketPreviousKeyGraceUntil = deadline.UTC()
+	} else if grace != "" {
+		return errors.New("FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL requires FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE")
+	}
+	epoch := strings.TrimSpace(os.Getenv("FERRY_TICKET_ROTATION_EPOCH"))
+	if epoch == "" {
+		// First deployment: epoch 1. Rotations set 2, 3, ... explicitly.
+		config.TicketRotationEpoch = 1
+		return nil
+	}
+	parsed, err := parseNonZeroUint32("FERRY_TICKET_ROTATION_EPOCH")
+	if err != nil {
+		return err
+	}
+	config.TicketRotationEpoch = parsed
+	return nil
 }
 
 func parseFraction(name string) (float64, error) {

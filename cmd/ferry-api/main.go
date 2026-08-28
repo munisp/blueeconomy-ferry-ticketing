@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,7 @@ import (
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketproof"
 )
 
 func main() {
@@ -127,11 +129,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	boarding, err := configureBoarding(cfg, ticketStore)
+	if err != nil {
+		return err
+	}
 	ticketService, err := ticketing.NewService(ticketStore, ledgerService, cfg.ManifestSalt)
 	if err != nil {
 		return err
 	}
-	server, err := httpapi.NewServer(authenticator, ticketService, ticketStore, manifestStore, cfg.ManifestSalt, cfg.CompletenessKPI, logger,
+	server, err := httpapi.NewServer(authenticator, ticketService, ticketStore, manifestStore, boarding, cfg.ManifestSalt, cfg.CompletenessKPI, logger,
 		func(ctx context.Context) error { return pool.Ping(ctx) }, pipeline)
 	if err != nil {
 		return err
@@ -156,4 +162,34 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}
 	return nil
+}
+
+// configureBoarding loads the env-injected Ed25519 signing key files and
+// builds the fail-closed boarding service (artifact mint/verify/embark).
+func configureBoarding(cfg config.Config, store *ticketing.PostgresStore) (*ticketing.BoardingService, error) {
+	current, err := ticketproof.LoadPrivateKeyFile(cfg.TicketSigningKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load ticket signing key: %w", err)
+	}
+	var previous *ticketproof.RotatedKey
+	if cfg.TicketPreviousSigningKeyFile != "" {
+		priorKey, err := ticketproof.LoadPrivateKeyFile(cfg.TicketPreviousSigningKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load previous ticket signing key: %w", err)
+		}
+		previous = &ticketproof.RotatedKey{
+			Public:     priorKey.Public().(ed25519.PublicKey),
+			Epoch:      cfg.TicketRotationEpoch - 1,
+			GraceUntil: cfg.TicketPreviousKeyGraceUntil,
+		}
+	}
+	keySet, err := ticketproof.NewKeySet(current, cfg.TicketRotationEpoch, previous)
+	if err != nil {
+		return nil, fmt.Errorf("configure ticket signing keys: %w", err)
+	}
+	boarding, err := ticketing.NewBoardingService(store, keySet, cfg.TicketWindowSecret)
+	if err != nil {
+		return nil, fmt.Errorf("configure boarding service: %w", err)
+	}
+	return boarding, nil
 }

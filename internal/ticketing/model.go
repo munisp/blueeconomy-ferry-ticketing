@@ -92,8 +92,14 @@ type Ticket struct {
 	PurchaserPrincipal string
 	CorrelationID      string
 	Embarked           bool
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// BoardedAt/BoardedBy/ArtifactKid are the first-scan-wins boarding
+	// record: set atomically exactly once (boarded_at IS NULL guard), with
+	// the principal that consumed the boarding and the artifact key id used.
+	BoardedAt   *time.Time
+	BoardedBy   string
+	ArtifactKid string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // Trip is a scheduled vessel departure with DB-enforced capacity.

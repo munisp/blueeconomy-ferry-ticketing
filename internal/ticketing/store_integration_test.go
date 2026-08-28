@@ -5,8 +5,10 @@ package ticketing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,14 +173,80 @@ func openIntegrationPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
-	migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", "0001_ferry_ticketing.sql")))
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	for _, migrationFile := range []string{"0001_ferry_ticketing.sql", "0002_signed_tickets.sql"} {
+		migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", migrationFile)))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", migrationFile, err)
+		}
+		if _, err := pool.Exec(ctx, string(migration)); err != nil {
+			t.Fatalf("apply migration %s: %v", migrationFile, err)
+		}
 	}
 	return pool
+}
+
+// TestConsumeBoardingFirstScanWinsIntegration proves the DB-enforced guard:
+// two gangways consuming the same ISSUED ticket concurrently — exactly one
+// UPDATE matches (boarded_at IS NULL), the other observes a duplicate.
+func TestConsumeBoardingFirstScanWinsIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool := openIntegrationPool(t, ctx)
+	defer pool.Close()
+
+	seedTrip(t, ctx, pool, "op-int", "vessel-int", "trip-int", 2)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tickets (ticket_id, trip_id, operator_id, passenger_digest_sha256, fare_ngn_minor, channel, state, purchaser_principal, correlation_id)
+		 VALUES ('ticket-board-1', 'trip-int', 'op-int', $1, 250000, 'DIRECT', 'ISSUED', 'kc-integration-buyer', 'corr-int-9')`,
+		"sha256:2222222222222222222222222222222222222222222222222222222222222222"); err != nil {
+		t.Fatalf("insert issued ticket: %v", err)
+	}
+
+	store, err := NewPostgresStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const gangways = 4
+	outcomes := make(chan bool, gangways)
+	var start sync.WaitGroup
+	start.Add(1)
+	for index := 0; index < gangways; index++ {
+		go func(gate string) {
+			start.Wait()
+			consumed, err := store.ConsumeBoarding(ctx, "op-int", "ticket-board-1", gate, "kid-int-1")
+			if err != nil {
+				t.Errorf("consume boarding: %v", err)
+			}
+			outcomes <- consumed
+		}(fmt.Sprintf("gate-%d", index))
+	}
+	start.Done()
+	wins := 0
+	for index := 0; index < gangways; index++ {
+		if <-outcomes {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("first-scan-wins violated: %d concurrent consumes succeeded", wins)
+	}
+
+	ticket, err := store.GetTicket(ctx, "ticket-board-1")
+	if err != nil {
+		t.Fatalf("load boarded ticket: %v", err)
+	}
+	if ticket.BoardedAt == nil || ticket.BoardedBy == "" || ticket.ArtifactKid != "kid-int-1" || !ticket.Embarked {
+		t.Fatalf("boarding record incomplete: %+v", ticket)
+	}
+	// A later consume (post-race) is also rejected.
+	consumed, err := store.ConsumeBoarding(ctx, "op-int", "ticket-board-1", "gate-late", "kid-int-1")
+	if err != nil || consumed {
+		t.Fatalf("second presentation must not consume (consumed=%v, err=%v)", consumed, err)
+	}
+	// Cross-operator consume never matches.
+	consumed, err = store.ConsumeBoarding(ctx, "op-other", "ticket-board-1", "gate-x", "kid-int-1")
+	if err != nil || consumed {
+		t.Fatalf("cross-operator consume must not match (consumed=%v, err=%v)", consumed, err)
+	}
 }
 
 func seedTrip(t *testing.T, ctx context.Context, pool *pgxpool.Pool, operatorID, vesselID, tripID string, capacity int) {

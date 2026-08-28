@@ -16,8 +16,11 @@ const (
 	EnvelopeVersion = "1.0"
 	// ProducerName identifies this service in every envelope.
 	ProducerName = "ferry-ticketing"
-	// ClassificationInternal is the envelope handling classification.
+	// ClassificationInternal is the default envelope handling classification.
 	ClassificationInternal = "INTERNAL"
+	// ClassificationConfidential marks fraud-telemetry envelopes restricted
+	// to the security-operations boundary.
+	ClassificationConfidential = "CONFIDENTIAL"
 )
 
 // Event is one unpublished outbox row.
@@ -84,6 +87,16 @@ var envelopeEventTypes = map[string]string{
 	"ferry.manifest.exported":       "ferries.manifest.submitted.v1",
 	"ferry.manifest.incomplete":     "ferries.manifest.incomplete.v1",
 	"ferry.adverse_weather.alerted": "ferries.manifest.adverse_weather.v1",
+	// Fraud telemetry consumed by the security-operations engine.
+	"ferry.ticket.verification_failed":    "ferries.ticketing.ticket_verification_failed.v1",
+	"ferry.ticket.duplicate_presentation": "ferries.ticketing.ticket_duplicate_presentation.v1",
+}
+
+// confidentialEventTypes are restricted to the security-operations boundary
+// (envelope classification CONFIDENTIAL); everything else is INTERNAL.
+var confidentialEventTypes = map[string]struct{}{
+	"ferry.ticket.verification_failed":    {},
+	"ferry.ticket.duplicate_presentation": {},
 }
 
 // BuildEnvelope maps one outbox event to the platform envelope. It fails
@@ -113,6 +126,10 @@ func BuildEnvelope(event Event) (Envelope, error) {
 	if correlationID == "" {
 		correlationID = event.EventID
 	}
+	classification := ClassificationInternal
+	if _, confidential := confidentialEventTypes[event.EventType]; confidential {
+		classification = ClassificationConfidential
+	}
 	return Envelope{
 		EnvelopeVersion: EnvelopeVersion,
 		EventID:         event.EventID,
@@ -131,7 +148,7 @@ func BuildEnvelope(event Event) (Envelope, error) {
 			Signature:        hex.EncodeToString(digest[:]),
 			LedgerCommitHash: stringField(resource, "ledger_transfer_id", "ledger_post_id", "manifest_digest_sha256"),
 		},
-		Classification: ClassificationInternal,
+		Classification: classification,
 	}, nil
 }
 

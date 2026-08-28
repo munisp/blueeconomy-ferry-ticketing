@@ -47,12 +47,14 @@ func TestDrainAgainstLivePostgresAndKafka(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
-	migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", "0001_ferry_ticketing.sql")))
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	for _, migrationFile := range []string{"0001_ferry_ticketing.sql", "0002_signed_tickets.sql"} {
+		migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", migrationFile)))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", migrationFile, err)
+		}
+		if _, err := pool.Exec(ctx, string(migration)); err != nil {
+			t.Fatalf("apply migration %s: %v", migrationFile, err)
+		}
 	}
 
 	payload := json.RawMessage(`{"ticket_id":"ticket-kafka-1","principal_id":"kc-integration","ledger_post_id":"tb-post-kafka-1"}`)
