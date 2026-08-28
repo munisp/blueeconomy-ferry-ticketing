@@ -104,6 +104,36 @@ previous key (`FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE`) is accepted until
 key is configured). Unknown kids, expired grace and epoch mismatches fail
 closed.
 
+**Key distribution to offline verifiers.** Verifiers (gate scanners, the
+mobile inspector app) obtain the public key set from
+`GET /v1/tickets/verification-keys` — no out-of-band operations channel is
+involved. The route requires an authenticated verifier role (`operator` or
+`gate`, the same roles as `POST /v1/tickets/verify`): the keys are public
+material, but the platform exposes no unauthenticated surface beyond
+health/readiness. The response serves **public keys only** — never private
+key material or the HMAC window secret:
+
+```json
+{
+  "current":  {"kid": "…", "algorithm": "Ed25519", "public_key_hex": "…", "epoch": 2, "grace_until_unix": null},
+  "previous": {"kid": "…", "algorithm": "Ed25519", "public_key_hex": "…", "epoch": 1, "grace_until_unix": 1767225600}
+}
+```
+
+`previous` is `null` when no rotation is configured or once the grace
+deadline has passed — the endpoint always reflects exactly what the service
+itself would accept, so a fresh fetch never caches a key the server would
+reject. Offline verifiers cache the set locally (the mobile inspector caches
+`current` + `previous` and refreshes when online); a failed or non-200
+refresh keeps the previous cache, and a scan against a kid outside the
+cached set fails closed as `unknown_kid`. Rotation runbook: deploy the new
+key as `FERRY_TICKET_SIGNING_KEY_FILE` with a bumped
+`FERRY_TICKET_ROTATION_EPOCH`, keep the retiring key in
+`FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE` with
+`FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL` covering the longest artifact
+lifetime (trip departure), and verifiers pick the set up on their next
+refresh.
+
 **Fraud telemetry.** Invalid signatures, unknown kids, expired rotation
 grace, stale window codes and duplicate presentations emit outbox events on
 `ferries.ticketing.v1` (`ferry.ticket.verification_failed` /
@@ -119,6 +149,7 @@ reason, kid and correlation id — never PII.
 |---|---|
 | `GET /v1/tickets/{id}/artifact` | Mint the signed artifact (purchaser or owning operator; ISSUED tickets only). |
 | `POST /v1/tickets/verify` | Stateless authenticity + window-code check (`operator`, `gate` roles). `200 {"valid": true, …}` or `401` + fraud event. |
+| `GET /v1/tickets/verification-keys` | Public verification key set for offline verifiers (`operator`, `gate` roles): current key + previous key inside its rotation grace window. |
 | `POST /v1/operator/tickets/{id}/embark` | Consume boarding with `{"artifact": "…"}`; first-scan-wins, `409 BOARDING_ALREADY_CONSUMED` on replay. |
 
 The embark body is optional: an empty body is the **legacy** raw-ticket-id
@@ -168,6 +199,7 @@ Ticketing routes: `POST /v1/tickets` (`passenger`, `agent-cashier`),
 `GET /v1/tickets/{id}` (owner, owning operator, oversight roles),
 `GET /v1/tickets/{id}/artifact` (owner, owning operator),
 `POST /v1/tickets/verify` (`operator`, `gate`),
+`GET /v1/tickets/verification-keys` (`operator`, `gate`),
 `POST /v1/tickets/{id}/refund` (owner or owning operator),
 `POST /v1/tickets/{id}/void` (owning operator or `state-officer`).
 

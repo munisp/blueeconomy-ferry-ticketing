@@ -56,6 +56,10 @@ type BoardingService interface {
 	MintArtifact(ctx context.Context, ticketID string) (ticketing.Artifact, error)
 	VerifyArtifact(ctx context.Context, token, principal, correlationID string) (ticketproof.Payload, error)
 	Embark(ctx context.Context, operatorID, ticketID, artifact, principal, correlationID string) (ticketing.Ticket, error)
+	// VerificationKeys exposes the public key set for offline verifiers;
+	// previous is nil when no rotation is configured or the grace window
+	// has expired.
+	VerificationKeys() (current ticketproof.VerificationKey, previous *ticketproof.VerificationKey)
 }
 
 // OperatorStore is the operator portal persistence boundary.
@@ -144,6 +148,11 @@ func (server *Server) routes(authenticator auth.Authenticator) {
 	server.mux.Handle("POST /v1/tickets/{id}/void", protected(http.HandlerFunc(server.voidTicket), RoleOperator, RoleStateOfficer))
 	server.mux.Handle("GET /v1/tickets/{id}/artifact", protected(http.HandlerFunc(server.getTicketArtifact), RolePassenger, RoleAgentCashier, RoleOperator))
 	server.mux.Handle("POST /v1/tickets/verify", protected(http.HandlerFunc(server.verifyTicketArtifact), RoleOperator, RoleGate))
+	// Key distribution for offline verifiers (gate scanners, the mobile
+	// inspector). Authenticated like the online verify route — the keys are
+	// public material, but the platform exposes no unauthenticated surface
+	// beyond health/readiness.
+	server.mux.Handle("GET /v1/tickets/verification-keys", protected(http.HandlerFunc(server.getVerificationKeys), RoleOperator, RoleGate))
 
 	server.mux.Handle("GET /v1/nimasa/trips/{tripID}/manifest", protected(http.HandlerFunc(server.getManifest),
 		RoleNIWAOfficer, RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleOperator, RoleStateOfficer, RoleFMMBEOversight))

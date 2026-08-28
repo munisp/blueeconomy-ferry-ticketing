@@ -128,6 +128,19 @@ func (service *BoardingService) MintArtifact(ctx context.Context, ticketID strin
 	}, nil
 }
 
+// VerificationKeys returns the distributable public key set for offline
+// verifiers (served by GET /v1/tickets/verification-keys). The previous key
+// is reported only while it is still inside its rotation grace window; once
+// the deadline passes it is no longer trusted and is withheld, so a fresh
+// key-set fetch always reflects exactly what this service would accept.
+func (service *BoardingService) VerificationKeys() (current ticketproof.VerificationKey, previous *ticketproof.VerificationKey) {
+	current, previous = service.keys.VerificationKeys()
+	if previous != nil && !service.now().Before(previous.GraceUntil) {
+		previous = nil
+	}
+	return current, previous
+}
+
 // VerifyArtifact is the stateless authenticity check (signature, key id,
 // rotation grace, artifact expiry, rotating window code). Verification needs
 // no database; a failure emits the TicketVerificationFailed fraud event.

@@ -293,3 +293,38 @@ func TestLoadPrivateKeyFile(t *testing.T) {
 	_, err = LoadPrivateKeyFile(garbage)
 	require.Error(t, err)
 }
+
+func TestVerificationKeysExposesPublicMaterialOnly(t *testing.T) {
+	current := generateKey(t)
+	previous := generateKey(t)
+	grace := testNow.Add(24 * time.Hour)
+	set, err := NewKeySet(current, 3, &RotatedKey{
+		Public:     previous.Public().(ed25519.PublicKey),
+		Epoch:      2,
+		GraceUntil: grace,
+	})
+	require.NoError(t, err)
+
+	currentView, previousView := set.VerificationKeys()
+	require.Equal(t, set.CurrentKeyID(), currentView.KeyID)
+	require.Equal(t, current.Public().(ed25519.PublicKey), ed25519.PublicKey(currentView.Public))
+	require.Equal(t, uint32(3), currentView.Epoch)
+	require.True(t, currentView.GraceUntil.IsZero(), "current key has no grace deadline")
+
+	require.NotNil(t, previousView)
+	require.Equal(t, uint32(2), previousView.Epoch)
+	require.Equal(t, previous.Public().(ed25519.PublicKey), ed25519.PublicKey(previousView.Public))
+	require.Equal(t, grace, previousView.GraceUntil)
+
+	// Mutating the returned slices must not corrupt the key set.
+	currentView.Public[0] ^= 0xff
+	again, _ := set.VerificationKeys()
+	require.Equal(t, current.Public().(ed25519.PublicKey), ed25519.PublicKey(again.Public))
+}
+
+func TestVerificationKeysWithoutRotation(t *testing.T) {
+	set, _ := newTestKeySet(t)
+	current, previous := set.VerificationKeys()
+	require.NotEmpty(t, current.KeyID)
+	require.Nil(t, previous)
+}

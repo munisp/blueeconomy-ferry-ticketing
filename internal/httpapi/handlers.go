@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/auth"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketproof"
 )
 
 type purchaseRequestBody struct {
@@ -388,6 +390,49 @@ func (server *Server) verifyTicketArtifact(writer http.ResponseWriter, request *
 		"rotationEpoch": payload.RotationEpoch,
 		"expiresAt":     payload.ExpiresAt,
 	})
+}
+
+// verificationKeyBody is the wire shape consumed by the mobile inspector key
+// cache (blueeconomy-mobile src/core/api/fetchers.ts). Field names and types
+// must stay in lockstep with that parser: kid (string), public_key_hex
+// (lowercase hex of the raw 32-byte Ed25519 public key), epoch (number),
+// grace_until_unix (number, null for the current key). Public material only —
+// private keys and the HMAC window secret are never served.
+type verificationKeyBody struct {
+	KeyID          string `json:"kid"`
+	Algorithm      string `json:"algorithm"`
+	PublicKeyHex   string `json:"public_key_hex"`
+	Epoch          uint32 `json:"epoch"`
+	GraceUntilUnix *int64 `json:"grace_until_unix"`
+}
+
+func verificationKeyView(key ticketproof.VerificationKey) verificationKeyBody {
+	body := verificationKeyBody{
+		KeyID:        key.KeyID,
+		Algorithm:    "Ed25519",
+		PublicKeyHex: hex.EncodeToString(key.Public),
+		Epoch:        key.Epoch,
+	}
+	if !key.GraceUntil.IsZero() {
+		until := key.GraceUntil.Unix()
+		body.GraceUntilUnix = &until
+	}
+	return body
+}
+
+// getVerificationKeys distributes the trusted public key set to offline
+// verifiers: the current signing key plus the previous key while it remains
+// inside its rotation grace window (`previous` is null otherwise). Verifiers
+// cache the set and refresh it online; a fetch failure keeps the old cache.
+func (server *Server) getVerificationKeys(writer http.ResponseWriter, _ *http.Request) {
+	current, previous := server.boarding.VerificationKeys()
+	response := map[string]any{"current": verificationKeyView(current)}
+	if previous != nil {
+		response["previous"] = verificationKeyView(*previous)
+	} else {
+		response["previous"] = nil
+	}
+	writeJSON(writer, http.StatusOK, response)
 }
 
 func (server *Server) dashboard(writer http.ResponseWriter, request *http.Request) {

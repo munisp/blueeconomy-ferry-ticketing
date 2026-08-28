@@ -265,6 +265,39 @@ func (set *KeySet) CurrentKeyID() string {
 	return base64.RawURLEncoding.EncodeToString(keyID(set.current.Public().(ed25519.PublicKey)))
 }
 
+// VerificationKey is the public, distributable view of one trusted key:
+// everything an offline verifier needs to pin the key (kid, raw public key,
+// epoch, grace deadline), and nothing secret — private key material and the
+// HMAC window secret are never part of this view.
+type VerificationKey struct {
+	KeyID      string // base64url kid, SHA-256(public key)[0:8]
+	Public     ed25519.PublicKey
+	Epoch      uint32
+	GraceUntil time.Time // zero for the current key
+}
+
+// VerificationKeys exposes the current and (when configured) previous public
+// keys for distribution to offline verifiers (gate scanners, the mobile
+// inspector). The previous key is reported regardless of its grace deadline;
+// consumers decide trust at their own clock.
+func (set *KeySet) VerificationKeys() (current VerificationKey, previous *VerificationKey) {
+	public := set.current.Public().(ed25519.PublicKey)
+	current = VerificationKey{
+		KeyID:  base64.RawURLEncoding.EncodeToString(keyID(public)),
+		Public: append(ed25519.PublicKey(nil), public...),
+		Epoch:  set.epoch,
+	}
+	if set.previous != nil {
+		previous = &VerificationKey{
+			KeyID:      base64.RawURLEncoding.EncodeToString(keyID(set.previous.Public)),
+			Public:     append(ed25519.PublicKey(nil), set.previous.Public...),
+			Epoch:      set.previous.Epoch,
+			GraceUntil: set.previous.GraceUntil,
+		}
+	}
+	return current, previous
+}
+
 // RotationEpoch returns the active signing epoch.
 func (set *KeySet) RotationEpoch() uint32 { return set.epoch }
 

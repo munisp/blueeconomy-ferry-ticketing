@@ -261,3 +261,31 @@ func TestEmbarkLegacyPath(t *testing.T) {
 	_, err = service.Embark(context.Background(), "op-2", "ticket-1", "", "op-stranger", "corr-3")
 	require.ErrorIs(t, err, ErrNotFound)
 }
+
+func TestVerificationKeysHidesPreviousAfterGraceBoundary(t *testing.T) {
+	_, current, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	_, previous, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	grace := boardingNow.Add(time.Hour)
+	keySet, err := ticketproof.NewKeySet(current, 2, &ticketproof.RotatedKey{
+		Public:     previous.Public().(ed25519.PublicKey),
+		Epoch:      1,
+		GraceUntil: grace,
+	})
+	require.NoError(t, err)
+	service, err := NewBoardingService(newFakeBoardingStore(), keySet, boardingWindowSecret)
+	require.NoError(t, err)
+
+	service.now = func() time.Time { return grace.Add(-time.Second) }
+	_, inGrace := service.VerificationKeys()
+	require.NotNil(t, inGrace, "previous key is distributed inside the grace window")
+
+	service.now = func() time.Time { return grace }
+	_, atDeadline := service.VerificationKeys()
+	require.Nil(t, atDeadline, "previous key is withheld at the grace deadline")
+
+	service.now = func() time.Time { return grace.Add(time.Second) }
+	_, after := service.VerificationKeys()
+	require.Nil(t, after, "previous key is withheld after the grace deadline")
+}
