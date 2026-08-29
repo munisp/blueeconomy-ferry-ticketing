@@ -161,6 +161,46 @@ func (service *Service) Void(_ context.Context, reserveTransferID string) error 
 	})
 }
 
+// ResolveReserve implements ticketing.Ledger: reconcile one reserve transfer
+// against the cluster. The post/void transfer IDs are deterministic, so their
+// presence is authoritative: an existing post transfer means the fare
+// settled; an existing void transfer means it was released. A reserve that
+// still exists without its pending flag was auto-voided by the pending
+// timeout (TigerBeetle resolves expired pending transfers without creating a
+// companion void transfer).
+func (service *Service) ResolveReserve(_ context.Context, reserveTransferID string) (ticketing.ReserveResolution, error) {
+	pendingID, err := ParseID(reserveTransferID)
+	if err != nil {
+		return ticketing.ReserveResolution{}, err
+	}
+	postID := transferIDFor(reserveTransferID, "post")
+	voidID := transferIDFor(reserveTransferID, "void")
+	transfers, err := service.client.LookupTransfers([]tigerbeetle.Uint128{pendingID, postID, voidID})
+	if err != nil {
+		return ticketing.ReserveResolution{}, fmt.Errorf("lookup reserve transfers: %w", err)
+	}
+	byID := make(map[tigerbeetle.Uint128]tigerbeetle.Transfer, len(transfers))
+	for _, transfer := range transfers {
+		byID[transfer.ID] = transfer
+	}
+	if _, posted := byID[postID]; posted {
+		return ticketing.ReserveResolution{Status: ticketing.ReserveStatusPosted, PostTransferID: postID.String()}, nil
+	}
+	if _, voided := byID[voidID]; voided {
+		return ticketing.ReserveResolution{Status: ticketing.ReserveStatusReleased}, nil
+	}
+	pending, exists := byID[pendingID]
+	if !exists {
+		return ticketing.ReserveResolution{Status: ticketing.ReserveStatusUnknown}, nil
+	}
+	if pending.TransferFlags().Pending {
+		return ticketing.ReserveResolution{Status: ticketing.ReserveStatusPending}, nil
+	}
+	// The pending transfer exists but is no longer pending and no post/void
+	// companion exists: the pending timeout auto-voided it.
+	return ticketing.ReserveResolution{Status: ticketing.ReserveStatusReleased}, nil
+}
+
 // Refund implements ticketing.Ledger: move the fare back from operator
 // revenue to the passenger clearing account.
 func (service *Service) Refund(_ context.Context, ticketID string, amountNGNMinor int64) (string, error) {

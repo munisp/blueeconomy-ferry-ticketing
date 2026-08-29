@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ type fakeStore struct {
 	keyPrincipals map[string]string
 	cashIns       []CashIn
 	events        []Event
+	// markPaidErr injects a MarkPaid failure (purchase-saga fault injection).
+	markPaidErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -102,6 +105,9 @@ func (store *fakeStore) transition(ticketID string, version int64, to State) (Ti
 func (store *fakeStore) MarkPaid(_ context.Context, ticketID string, version int64, ledgerPostID string, cashIn *CashIn, events []Event) (Ticket, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.markPaidErr != nil {
+		return Ticket{}, store.markPaidErr
+	}
 	ticket, err := store.transition(ticketID, version, StatePaid)
 	if err != nil {
 		return Ticket{}, err
@@ -151,7 +157,45 @@ func (store *fakeStore) GetTrip(_ context.Context, tripID string) (Trip, error) 
 	return trip, nil
 }
 
-// fakeLedger records reserve/post/void/refund calls.
+func (store *fakeStore) listByStateBefore(state State, cutoff time.Time, limit int, useUpdated bool) []Ticket {
+	out := make([]Ticket, 0)
+	for _, ticket := range store.tickets {
+		at := ticket.CreatedAt
+		if useUpdated {
+			at = ticket.UpdatedAt
+		}
+		if ticket.State == state && at.Before(cutoff) {
+			out = append(out, ticket)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if useUpdated {
+			return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (store *fakeStore) ListReservedBefore(_ context.Context, cutoff time.Time, limit int) ([]Ticket, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.listByStateBefore(StateReserved, cutoff, limit, false), nil
+}
+
+func (store *fakeStore) ListUnissuedPaidBefore(_ context.Context, cutoff time.Time, limit int) ([]Ticket, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.listByStateBefore(StatePaid, cutoff, limit, true), nil
+}
+
+// fakeLedger records reserve/post/void/refund calls and resolves reserve
+// state from those records exactly like the TigerBeetle boundary contract:
+// posted beats voided, an auto-voided (timed-out) pending reserve resolves as
+// released.
 type fakeLedger struct {
 	mu         sync.Mutex
 	reserved   []string
@@ -160,6 +204,10 @@ type fakeLedger struct {
 	refunded   []string
 	reserveErr error
 	postErr    error
+	resolveErr error
+	// timedOut simulates pending reserves auto-voided by the TigerBeetle
+	// pending-transfer timeout (no void transfer is recorded cluster-side).
+	timedOut map[string]bool
 }
 
 func (ledger *fakeLedger) Reserve(_ context.Context, ticketID string, _ Channel, _ int64) (string, error) {
@@ -194,6 +242,32 @@ func (ledger *fakeLedger) Refund(_ context.Context, ticketID string, _ int64) (s
 	defer ledger.mu.Unlock()
 	ledger.refunded = append(ledger.refunded, ticketID)
 	return "refund-" + ticketID, nil
+}
+
+func (ledger *fakeLedger) ResolveReserve(_ context.Context, reserveID string) (ReserveResolution, error) {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if ledger.resolveErr != nil {
+		return ReserveResolution{}, ledger.resolveErr
+	}
+	contains := func(list []string) bool {
+		for _, candidate := range list {
+			if candidate == reserveID {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case contains(ledger.posted):
+		return ReserveResolution{Status: ReserveStatusPosted, PostTransferID: "post-" + reserveID}, nil
+	case contains(ledger.voided) || ledger.timedOut[reserveID]:
+		return ReserveResolution{Status: ReserveStatusReleased}, nil
+	case contains(ledger.reserved):
+		return ReserveResolution{Status: ReserveStatusPending}, nil
+	default:
+		return ReserveResolution{Status: ReserveStatusUnknown}, nil
+	}
 }
 
 const testSalt = "0123456789abcdef"
@@ -315,6 +389,138 @@ func TestRefundTransitionsAndPostsRefund(t *testing.T) {
 	// Terminal: a second refund fails closed.
 	_, err = service.Refund(context.Background(), ticket.TicketID, "subject-1", "passenger", "corr-refund-2")
 	require.ErrorIs(t, err, ErrInvalidTransition)
+}
+
+// TestPurchaseReplayResumesInterruptedSaga proves the FE-1 retry-convergence
+// contract: a replayed idempotency key whose stored ticket is still RESERVED
+// (a previous attempt died after ReserveSeat) is driven through settlement
+// and issuance instead of being returned stranded.
+func TestPurchaseReplayResumesInterruptedSaga(t *testing.T) {
+	service, store, ledger := seededService(t)
+	// First attempt dies after the seat reservation: RESERVED ticket with a
+	// pending reserve, no post, no payment.
+	ticket := Ticket{
+		TicketID: "ticket-interrupted", TripID: "trip-1", OperatorID: "op-1",
+		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
+		State: StateReserved, Version: 1, LedgerReserveID: "reserve-ticket-interrupted",
+		PurchaserPrincipal: "subject-1", CorrelationID: "corr-key-1",
+	}
+	_, err := store.ReserveSeat(context.Background(), ticket, "key-1", Event{
+		EventID: "evt-1", Topic: TopicTicketing, SubjectID: ticket.TicketID,
+		EventType: EventTicketReserved, CorrelationID: ticket.CorrelationID,
+		Payload: map[string]any{"ticket_id": ticket.TicketID},
+	})
+	require.NoError(t, err)
+	replayed, err := service.Purchase(context.Background(), purchaseRequest("key-1"))
+	require.NoError(t, err)
+	require.Equal(t, StateIssued, replayed.State, "replay must resume the saga, not return a stranded RESERVED ticket")
+	require.Equal(t, ticket.TicketID, replayed.TicketID)
+	require.Contains(t, ledger.posted, "reserve-ticket-interrupted", "the ORIGINAL reserve is settled")
+	require.Len(t, ledger.voided, 1, "the duplicate reserve from the replay is voided")
+	require.Len(t, ledger.reserved, 1)
+}
+
+// TestPurchaseMarkPaidFailureReconcilesAndRetryConverges is the FE-1 fault
+// injection: Post succeeds (irreversible) and MarkPaid fails. The reconciler
+// must converge money and ticket state (ticket reaches PAID/ISSUED; the
+// charge is honored), and an idempotent retry returns the converged ticket.
+func TestPurchaseMarkPaidFailureReconcilesAndRetryConverges(t *testing.T) {
+	service, store, ledger := seededService(t)
+	store.markPaidErr = errors.New("postgres connection reset")
+	_, err := service.Purchase(context.Background(), purchaseRequest("key-1"))
+	require.Error(t, err, "the half-commit surfaces as an error")
+
+	// Diverged: reserve posted on the ledger, ticket still RESERVED.
+	var stranded Ticket
+	for _, candidate := range store.tickets {
+		stranded = candidate
+	}
+	require.Equal(t, StateReserved, stranded.State)
+	require.Len(t, ledger.posted, 1, "the post is irreversible and already settled")
+
+	// The reconciler completes the posted divergence.
+	store.markPaidErr = nil
+	report, err := service.Reconcile(context.Background(), 0, 0, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Completed)
+	require.Zero(t, report.Failed)
+	recovered, err := store.GetTicket(context.Background(), stranded.TicketID)
+	require.NoError(t, err)
+	require.Equal(t, StateIssued, recovered.State, "charged passenger receives the issued ticket")
+	require.Equal(t, "post-"+stranded.LedgerReserveID, recovered.LedgerPostID)
+
+	// The idempotent retry converges to the same issued ticket.
+	retry, err := service.Purchase(context.Background(), purchaseRequest("key-1"))
+	require.NoError(t, err)
+	require.Equal(t, recovered.TicketID, retry.TicketID)
+	require.Equal(t, StateIssued, retry.State)
+	require.Len(t, ledger.posted, 1, "no double charge across failure, reconciliation and retry")
+}
+
+// TestReconcileExpiresAutoVoidedReservation is the FE-5 sweep: a RESERVED
+// ticket whose pending reserve auto-voided via the TigerBeetle timeout can
+// never be paid; the reconciler expires it and frees the seat.
+func TestReconcileExpiresAutoVoidedReservation(t *testing.T) {
+	service, store, ledger := seededService(t)
+	store.trips["trip-1"] = Trip{
+		TripID: "trip-1", VesselID: "vessel-1", OperatorID: "op-1",
+		RouteReference: "route-lagos-badagry", TerminalReference: "terminal-1",
+		ScheduledDeparture: time.Now().Add(2 * time.Hour), FareNGNMinor: 250000,
+		Capacity: 2, SeatsReserved: 1, Status: "SCHEDULED",
+	}
+	aged := time.Now().Add(-time.Hour).UTC()
+	store.tickets["ticket-aged"] = Ticket{
+		TicketID: "ticket-aged", TripID: "trip-1", OperatorID: "op-1",
+		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
+		State: StateReserved, Version: 1, LedgerReserveID: "reserve-ticket-aged",
+		PurchaserPrincipal: "subject-1", CorrelationID: "corr-aged", CreatedAt: aged,
+	}
+	ledger.timedOut = map[string]bool{"reserve-ticket-aged": true}
+
+	report, err := service.Reconcile(context.Background(), time.Minute, 30*time.Minute, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Expired)
+	require.Zero(t, report.Failed)
+	expired, err := store.GetTicket(context.Background(), "ticket-aged")
+	require.NoError(t, err)
+	require.Equal(t, StateExpired, expired.State)
+	require.Equal(t, 0, store.trips["trip-1"].SeatsReserved, "expiry releases the reserved seat")
+
+	// A still-pending reserve within its timeout is left for a later sweep.
+	store.tickets["ticket-fresh"] = Ticket{
+		TicketID: "ticket-fresh", TripID: "trip-1", OperatorID: "op-1",
+		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
+		State: StateReserved, Version: 1, LedgerReserveID: "reserve-ticket-fresh",
+		PurchaserPrincipal: "subject-1", CorrelationID: "corr-fresh",
+		CreatedAt: time.Now().Add(-2 * time.Minute).UTC(),
+	}
+	ledger.reserved = append(ledger.reserved, "reserve-ticket-fresh")
+	report, err = service.Reconcile(context.Background(), time.Minute, 30*time.Minute, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Pending)
+	require.Zero(t, report.Expired)
+	fresh, err := store.GetTicket(context.Background(), "ticket-fresh")
+	require.NoError(t, err)
+	require.Equal(t, StateReserved, fresh.State)
+}
+
+// TestReconcileIssuesInterruptedPaidTicket covers purchases interrupted
+// between payment and issuance (MarkIssued failed after MarkPaid).
+func TestReconcileIssuesInterruptedPaidTicket(t *testing.T) {
+	service, store, _ := seededService(t)
+	store.tickets["ticket-paid"] = Ticket{
+		TicketID: "ticket-paid", TripID: "trip-1", OperatorID: "op-1",
+		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
+		State: StatePaid, Version: 2, LedgerReserveID: "reserve-ticket-paid",
+		LedgerPostID: "post-reserve-ticket-paid",
+		PurchaserPrincipal: "subject-1", CorrelationID: "corr-paid",
+	}
+	report, err := service.Reconcile(context.Background(), 0, 0, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Completed)
+	issued, err := store.GetTicket(context.Background(), "ticket-paid")
+	require.NoError(t, err)
+	require.Equal(t, StateIssued, issued.State)
 }
 
 func TestVoidReleasesPendingReserve(t *testing.T) {

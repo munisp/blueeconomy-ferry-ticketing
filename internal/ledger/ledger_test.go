@@ -15,6 +15,8 @@ type fakeClient struct {
 	accounts  []tigerbeetle.Account
 	err       error
 	status    tigerbeetle.CreateTransferStatus
+	// lookup is the cluster-visible transfer store for LookupTransfers.
+	lookup map[tigerbeetle.Uint128]tigerbeetle.Transfer
 }
 
 func (client *fakeClient) CreateAccounts(accounts []tigerbeetle.Account) ([]tigerbeetle.CreateAccountResult, error) {
@@ -39,7 +41,16 @@ func (client *fakeClient) CreateTransfers(transfers []tigerbeetle.Transfer) ([]t
 }
 
 func (client *fakeClient) LookupTransfers(ids []tigerbeetle.Uint128) ([]tigerbeetle.Transfer, error) {
-	return nil, nil
+	if client.err != nil {
+		return nil, client.err
+	}
+	found := make([]tigerbeetle.Transfer, 0, len(ids))
+	for _, id := range ids {
+		if transfer, ok := client.lookup[id]; ok {
+			found = append(found, transfer)
+		}
+	}
+	return found, nil
 }
 
 func testTopology() Topology {
@@ -149,6 +160,77 @@ func TestLedgerFailsClosedOnClusterErrors(t *testing.T) {
 	require.NoError(t, err)
 	_, err = service.Reserve(context.Background(), "ticket-1", ticketing.ChannelDirect, 1)
 	require.Error(t, err, "non-created transfer status fails closed")
+}
+
+// TestResolveReserve pins the reconciler's money-state resolution: posted
+// beats everything, an explicit void releases, a pending transfer whose
+// pending flag cleared without a companion post/void was auto-voided by the
+// timeout, and a missing transfer is unknown.
+func TestResolveReserve(t *testing.T) {
+	reserveID := transferIDFor("ticket-1", "reserve")
+	// Post/void companion IDs derive from the reserve transfer ID string,
+	// mirroring ledger.Post/ledger.Void.
+	postID := transferIDFor(reserveID.String(), "post")
+	voidID := transferIDFor(reserveID.String(), "void")
+	pendingTransfer := tigerbeetle.Transfer{ID: reserveID, Flags: tigerbeetle.TransferFlags{Pending: true}.ToUint16()}
+
+	cases := []struct {
+		name       string
+		cluster    map[tigerbeetle.Uint128]tigerbeetle.Transfer
+		wantStatus ticketing.ReserveStatus
+		wantPostID bool
+	}{
+		{
+			name:       "posted reserve resolves with the deterministic post id",
+			cluster:    map[tigerbeetle.Uint128]tigerbeetle.Transfer{reserveID: pendingTransfer, postID: {ID: postID}},
+			wantStatus: ticketing.ReserveStatusPosted,
+			wantPostID: true,
+		},
+		{
+			name:       "explicit void releases",
+			cluster:    map[tigerbeetle.Uint128]tigerbeetle.Transfer{reserveID: pendingTransfer, voidID: {ID: voidID}},
+			wantStatus: ticketing.ReserveStatusReleased,
+		},
+		{
+			name:       "open reserve stays pending",
+			cluster:    map[tigerbeetle.Uint128]tigerbeetle.Transfer{reserveID: pendingTransfer},
+			wantStatus: ticketing.ReserveStatusPending,
+		},
+		{
+			name: "timeout auto-void clears the pending flag without a companion transfer",
+			cluster: map[tigerbeetle.Uint128]tigerbeetle.Transfer{
+				reserveID: {ID: reserveID, Flags: 0},
+			},
+			wantStatus: ticketing.ReserveStatusReleased,
+		},
+		{
+			name:       "unknown reserve",
+			cluster:    map[tigerbeetle.Uint128]tigerbeetle.Transfer{},
+			wantStatus: ticketing.ReserveStatusUnknown,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := &fakeClient{lookup: testCase.cluster}
+			service, err := New(client, testTopology())
+			require.NoError(t, err)
+			resolution, err := service.ResolveReserve(context.Background(), reserveID.String())
+			require.NoError(t, err)
+			require.Equal(t, testCase.wantStatus, resolution.Status)
+			if testCase.wantPostID {
+				require.Equal(t, postID.String(), resolution.PostTransferID)
+			} else {
+				require.Empty(t, resolution.PostTransferID)
+			}
+		})
+	}
+
+	service, err := New(&fakeClient{err: errors.New("cluster unreachable")}, testTopology())
+	require.NoError(t, err)
+	_, err = service.ResolveReserve(context.Background(), reserveID.String())
+	require.Error(t, err, "lookup failures fail closed")
+	_, err = service.ResolveReserve(context.Background(), "not-a-transfer-id")
+	require.Error(t, err, "malformed ids fail closed")
 }
 
 func TestParseIDRejectsZero(t *testing.T) {

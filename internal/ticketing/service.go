@@ -53,6 +53,30 @@ const (
 	EventAdverseWeather     = "ferry.adverse_weather.alerted"
 )
 
+// ReserveStatus is the reconciled state of a pending ledger reserve, resolved
+// from TigerBeetle transfer lookups (never guessed from local state).
+type ReserveStatus string
+
+const (
+	// ReserveStatusUnknown means the reserve transfer does not exist.
+	ReserveStatusUnknown ReserveStatus = "UNKNOWN"
+	// ReserveStatusPending means the two-phase reserve is still open.
+	ReserveStatusPending ReserveStatus = "PENDING"
+	// ReserveStatusPosted means the reserve was settled (irreversible).
+	ReserveStatusPosted ReserveStatus = "POSTED"
+	// ReserveStatusReleased means the reserve was voided or auto-voided by
+	// the pending-transfer timeout; the buyer was never charged.
+	ReserveStatusReleased ReserveStatus = "RELEASED"
+)
+
+// ReserveResolution is the outcome of resolving one reserve transfer.
+type ReserveResolution struct {
+	Status ReserveStatus
+	// PostTransferID is the deterministic post transfer ID when the reserve
+	// was settled; empty otherwise.
+	PostTransferID string
+}
+
 // Ledger is the TigerBeetle boundary. Implementations are fail-closed: an
 // unconfigured ledger is a construction error, never a silent skip.
 type Ledger interface {
@@ -66,6 +90,9 @@ type Ledger interface {
 	// Refund moves the fare back from operator revenue to the clearing
 	// account and returns the refund transfer ID.
 	Refund(ctx context.Context, ticketID string, amountNGNMinor int64) (string, error)
+	// ResolveReserve reports the authoritative state of one reserve transfer
+	// so the reconciler can converge ticket state with money state.
+	ResolveReserve(ctx context.Context, reserveTransferID string) (ReserveResolution, error)
 }
 
 // Store is the persistence boundary. PostgreSQL is the production
@@ -86,6 +113,13 @@ type Store interface {
 	// VOID) with optimistic concurrency and the outbox event.
 	Transition(ctx context.Context, ticketID string, version int64, to State, event Event) (Ticket, error)
 	GetTrip(ctx context.Context, tripID string) (Trip, error)
+	// ListReservedBefore returns up to limit RESERVED tickets created before
+	// cutoff, oldest first (reconciler sweep input).
+	ListReservedBefore(ctx context.Context, cutoff time.Time, limit int) ([]Ticket, error)
+	// ListUnissuedPaidBefore returns up to limit PAID (not yet ISSUED)
+	// tickets last updated before cutoff, oldest first (reconciler sweep
+	// input for purchases interrupted between payment and issuance).
+	ListUnissuedPaidBefore(ctx context.Context, cutoff time.Time, limit int) ([]Ticket, error)
 }
 
 // CashIn is the agent cash-in ledger event.
@@ -171,38 +205,84 @@ func (service *Service) Purchase(ctx context.Context, request PurchaseRequest) (
 	}
 	if replayed != nil {
 		// Idempotent replay: the original purchase already reserved the fare.
+		// Void the duplicate reserve created above, then resume the saga from
+		// the stored ticket state so a previously interrupted purchase (post
+		// or MarkPaid/MarkIssued failure) converges instead of being stranded.
 		if err := service.ledger.Void(ctx, reserveID); err != nil {
 			return Ticket{}, fmt.Errorf("void duplicate ledger reserve: %w", err)
 		}
-		return *replayed, nil
+		switch replayed.State {
+		case StateIssued:
+			return *replayed, nil
+		case StateReserved, StatePaid:
+			return service.complete(ctx, *replayed, trip)
+		default:
+			return Ticket{}, fmt.Errorf("%w: idempotent replay resolved to terminal state %s", ErrInvalidTransition, replayed.State)
+		}
 	}
+	return service.complete(ctx, ticket, trip)
+}
 
-	postID, err := service.ledger.Post(ctx, reserveID)
-	if err != nil {
-		return Ticket{}, fmt.Errorf("settle fare on ledger: %w", err)
+// complete drives a RESERVED or PAID ticket through settlement and issuance.
+// It is the shared tail of the purchase saga for the fresh path, the
+// idempotent-replay path and the reconciler: every step is idempotent-safe
+// (deterministic ledger transfer IDs deduplicate cluster-side; store
+// transitions are optimistic-concurrency guarded).
+func (service *Service) complete(ctx context.Context, ticket Ticket, trip Trip) (Ticket, error) {
+	var err error
+	if ticket.State == StateReserved {
+		postID, err := service.ledger.Post(ctx, ticket.LedgerReserveID)
+		if err != nil {
+			return Ticket{}, fmt.Errorf("settle fare on ledger: %w", err)
+		}
+		ticket, err = service.markPaid(ctx, ticket, postID)
+		if err != nil {
+			return Ticket{}, err
+		}
 	}
+	if ticket.State == StatePaid {
+		ticket, err = service.issue(ctx, ticket, trip)
+		if err != nil {
+			return Ticket{}, err
+		}
+	}
+	if ticket.State != StateIssued {
+		return Ticket{}, fmt.Errorf("%w: cannot complete ticket in state %s", ErrInvalidTransition, ticket.State)
+	}
+	return ticket, nil
+}
+
+// markPaid records the settled fare: RESERVED -> PAID with the ledger post ID
+// and, for the agent channel, the cash-in ledger event, in one transaction.
+// A failure here after the ledger post leaves money and ticket state
+// diverged; the reconciler (Reconcile) converges it, and an idempotent
+// purchase retry resumes through complete.
+func (service *Service) markPaid(ctx context.Context, ticket Ticket, postID string) (Ticket, error) {
 	events := []Event{service.event(EventTicketPaid, ticket, map[string]any{"ledger_transfer_id": postID})}
 	var cashIn *CashIn
-	if request.Channel == ChannelAgentCashIn {
+	if ticket.Channel == ChannelAgentCashIn {
 		cashIn = &CashIn{
 			CashInID:         uuid.NewString(),
-			AgentID:          request.AgentID,
+			AgentID:          ticket.AgentID,
 			AmountNGNMinor:   ticket.FareNGNMinor,
 			LedgerTransferID: postID,
 		}
 		events = append(events, service.event(EventAgentCashIn, ticket, map[string]any{
 			"cash_in_id":         cashIn.CashInID,
-			"agent_id":           request.AgentID,
+			"agent_id":           ticket.AgentID,
 			"amount_ngn_minor":   ticket.FareNGNMinor,
 			"ledger_transfer_id": postID,
 		}))
 	}
-	paid, err := service.store.MarkPaid(ctx, ticket.TicketID, 1, postID, cashIn, events)
+	paid, err := service.store.MarkPaid(ctx, ticket.TicketID, ticket.Version, postID, cashIn, events)
 	if err != nil {
 		return Ticket{}, fmt.Errorf("mark ticket paid: %w", err)
 	}
-	ticket = paid
+	return paid, nil
+}
 
+// issue assigns the seat and moves PAID -> ISSUED with the boarding event.
+func (service *Service) issue(ctx context.Context, ticket Ticket, trip Trip) (Ticket, error) {
 	issued, err := service.store.MarkIssued(ctx, ticket.TicketID, ticket.Version, ticket.SeatNumberValue(), service.event(EventTicketIssued, ticket, map[string]any{
 		"voyage_reference":        trip.TripID,
 		"route_reference":         trip.RouteReference,
@@ -262,6 +342,127 @@ func (service *Service) Refund(ctx context.Context, ticketID, principal, princip
 // an operator policy decision reconciled separately.
 func (service *Service) Expire(ctx context.Context, ticketID, correlationID string) (Ticket, error) {
 	return service.terminal(ctx, ticketID, StateExpired, EventTicketExpired, correlationID)
+}
+
+// ReconcileReport summarizes one reconciler sweep.
+type ReconcileReport struct {
+	// Completed counts tickets driven forward (posted reserve -> PAID ->
+	// ISSUED, or PAID -> ISSUED).
+	Completed int
+	// Expired counts RESERVED tickets whose reserve was released (voided or
+	// auto-voided by the pending-transfer timeout) moved to EXPIRED.
+	Expired int
+	// Pending counts tickets whose reserve is still open or which are too
+	// young for the configured ages; revisited by the next sweep.
+	Pending int
+	// Failed counts per-ticket errors; the sweep continues and the next run
+	// retries them (every recovery step is idempotent-safe).
+	Failed int
+}
+
+// Reconcile is the purchase-saga recovery sweep. It resolves each aged
+// RESERVED ticket's reserve against TigerBeetle and converges money and
+// ticket state:
+//
+//   - POSTED reserve + RESERVED ticket (MarkPaid failed after Post; the
+//     ledger post is irreversible): the ticket is driven through payment and
+//     issuance so the passenger receives what they were charged for.
+//   - RELEASED reserve + RESERVED ticket (pending timeout auto-voided the
+//     reserve; the passenger can never pay it): the ticket is expired and its
+//     seat released.
+//   - PENDING reserve: left for the TigerBeetle timeout and a later sweep.
+//
+// It also drives PAID-but-never-ISSUED tickets (interrupted between payment
+// and issuance) to ISSUED. completionAge is the minimum ticket age before the
+// reconciler completes a posted divergence; expiryAge is the minimum age
+// before a released reservation expires (operator grace over the ledger
+// pending timeout). Per-ticket failures never abort the sweep.
+func (service *Service) Reconcile(ctx context.Context, completionAge, expiryAge time.Duration, limit int) (ReconcileReport, error) {
+	if limit <= 0 {
+		return ReconcileReport{}, errors.New("reconcile batch limit must be positive")
+	}
+	if completionAge < 0 || expiryAge < 0 {
+		return ReconcileReport{}, errors.New("reconcile ages must be non-negative")
+	}
+	var report ReconcileReport
+	now := service.now()
+	sweepCutoff := now.Add(-completionAge)
+	if expiryAge < completionAge {
+		sweepCutoff = now.Add(-expiryAge)
+	}
+	stuck, err := service.store.ListReservedBefore(ctx, sweepCutoff, limit)
+	if err != nil {
+		return report, fmt.Errorf("list reserved tickets for reconciliation: %w", err)
+	}
+	for _, ticket := range stuck {
+		age := now.Sub(ticket.CreatedAt)
+		if ticket.LedgerReserveID == "" {
+			// Fail closed: a RESERVED ticket without a reserve reference is
+			// corrupt (the reserve always precedes the ticket row); never
+			// guess its money state.
+			report.Failed++
+			continue
+		}
+		resolution, err := service.ledger.ResolveReserve(ctx, ticket.LedgerReserveID)
+		if err != nil {
+			report.Failed++
+			continue
+		}
+		switch {
+		case resolution.Status == ReserveStatusPosted && age >= completionAge:
+			trip, err := service.store.GetTrip(ctx, ticket.TripID)
+			if err != nil {
+				report.Failed++
+				continue
+			}
+			completed := ticket
+			if resolution.PostTransferID != "" {
+				// The reserve already settled cluster-side; skip a redundant
+				// post and record the deterministic post transfer ID.
+				completed, err = service.markPaid(ctx, ticket, resolution.PostTransferID)
+			} else {
+				completed, err = service.complete(ctx, ticket, trip)
+			}
+			if err != nil {
+				report.Failed++
+				continue
+			}
+			if completed.State == StatePaid {
+				if _, err := service.issue(ctx, completed, trip); err != nil {
+					report.Failed++
+					continue
+				}
+			}
+			report.Completed++
+		case resolution.Status == ReserveStatusReleased && age >= expiryAge:
+			if _, err := service.terminal(ctx, ticket.TicketID, StateExpired, EventTicketExpired, ticket.CorrelationID); err != nil {
+				report.Failed++
+				continue
+			}
+			report.Expired++
+		default:
+			report.Pending++
+		}
+	}
+	// Purchases interrupted between payment and issuance (MarkIssued failed):
+	// money is settled and the ticket is PAID; finish issuance.
+	unissued, err := service.store.ListUnissuedPaidBefore(ctx, now.Add(-completionAge), limit)
+	if err != nil {
+		return report, fmt.Errorf("list paid tickets for reconciliation: %w", err)
+	}
+	for _, ticket := range unissued {
+		trip, err := service.store.GetTrip(ctx, ticket.TripID)
+		if err != nil {
+			report.Failed++
+			continue
+		}
+		if _, err := service.issue(ctx, ticket, trip); err != nil {
+			report.Failed++
+			continue
+		}
+		report.Completed++
+	}
+	return report, nil
 }
 
 // Void cancels a ticket without a ledger refund (void before settlement).

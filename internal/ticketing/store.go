@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -277,6 +278,68 @@ func transitionTx(ctx context.Context, tx pgx.Tx, ticketID string, version int64
 	ticket.State = to
 	ticket.Version = version + 1
 	return ticket, nil
+}
+
+// ListReservedBefore implements Store (reconciler sweep input).
+func (store *PostgresStore) ListReservedBefore(ctx context.Context, cutoff time.Time, limit int) ([]Ticket, error) {
+	return store.listTicketsByStateBefore(ctx, StateReserved, "created_at", cutoff, limit)
+}
+
+// ListUnissuedPaidBefore implements Store (reconciler sweep input).
+func (store *PostgresStore) ListUnissuedPaidBefore(ctx context.Context, cutoff time.Time, limit int) ([]Ticket, error) {
+	return store.listTicketsByStateBefore(ctx, StatePaid, "updated_at", cutoff, limit)
+}
+
+// listTicketsByStateBefore scans non-terminal tickets in one state older than
+// the cutoff, oldest first. state and timeColumn are internal constants,
+// never caller input.
+func (store *PostgresStore) listTicketsByStateBefore(ctx context.Context, state State, timeColumn string, cutoff time.Time, limit int) ([]Ticket, error) {
+	if limit <= 0 {
+		return nil, errors.New("list limit must be positive")
+	}
+	if timeColumn != "created_at" && timeColumn != "updated_at" {
+		return nil, fmt.Errorf("unsupported ticket time column %q", timeColumn)
+	}
+	rows, err := store.pool.Query(ctx,
+		`SELECT ticket_id, trip_id, operator_id, passenger_digest_sha256, fare_ngn_minor, channel, state,
+		        version, seat_number, agent_id, ledger_reserve_id, ledger_post_id, purchaser_principal,
+		        correlation_id, embarked, boarded_at, boarded_by, artifact_kid, created_at, updated_at
+		 FROM tickets WHERE state = $1 AND `+timeColumn+` < $2 ORDER BY `+timeColumn+` LIMIT $3`,
+		string(state), cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list %s tickets: %w", state, err)
+	}
+	defer rows.Close()
+	tickets := make([]Ticket, 0)
+	for rows.Next() {
+		var ticket Ticket
+		var seatNumber *int
+		var agentID, reserveID, postID, boardedBy, artifactKid *string
+		if err := rows.Scan(&ticket.TicketID, &ticket.TripID, &ticket.OperatorID, &ticket.PassengerDigest,
+			&ticket.FareNGNMinor, &ticket.Channel, &ticket.State, &ticket.Version, &seatNumber, &agentID,
+			&reserveID, &postID, &ticket.PurchaserPrincipal, &ticket.CorrelationID, &ticket.Embarked,
+			&ticket.BoardedAt, &boardedBy, &artifactKid, &ticket.CreatedAt, &ticket.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan %s ticket: %w", state, err)
+		}
+		ticket.SeatNumber = seatNumber
+		if agentID != nil {
+			ticket.AgentID = *agentID
+		}
+		if reserveID != nil {
+			ticket.LedgerReserveID = *reserveID
+		}
+		if postID != nil {
+			ticket.LedgerPostID = *postID
+		}
+		if boardedBy != nil {
+			ticket.BoardedBy = *boardedBy
+		}
+		if artifactKid != nil {
+			ticket.ArtifactKid = *artifactKid
+		}
+		tickets = append(tickets, ticket)
+	}
+	return tickets, rows.Err()
 }
 
 // GetTrip implements Store.

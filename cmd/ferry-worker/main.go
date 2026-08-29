@@ -10,16 +10,20 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	tigerbeetle "github.com/tigerbeetle/tigerbeetle-go"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 	ferryworkflow "github.com/munisp/blueeconomy-ferry-ticketing/internal/workflow"
 )
@@ -38,6 +42,31 @@ func required(name string) (string, error) {
 		return "", fmt.Errorf("%s is required", name)
 	}
 	return value, nil
+}
+
+func requiredUint32(name string) (uint32, error) {
+	value, err := required(name)
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || parsed == 0 {
+		return 0, fmt.Errorf("%s must be a non-zero uint32", name)
+	}
+	return uint32(parsed), nil
+}
+
+// optionalDurationSeconds reads a seconds-valued env var with a default.
+func optionalDurationSeconds(name string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || parsed == 0 {
+		return 0, fmt.Errorf("%s must be a positive number of seconds", name)
+	}
+	return time.Duration(parsed) * time.Second, nil
 }
 
 func run(logger *slog.Logger) error {
@@ -73,6 +102,16 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	// Purchase-saga reconciler: resolves aged RESERVED tickets against the
+	// TigerBeetle reserve state so a posted charge always reaches PAID/ISSUED
+	// and an auto-voided reserve always reaches EXPIRED (releasing the seat).
+	reconciler, err := configureReconciler(store)
+	if err != nil {
+		return err
+	}
+	defer reconciler.close()
+	go reconciler.run(ctx, logger)
 
 	temporalClient, err := client.Dial(client.Options{
 		HostPort:  temporalAddress,
@@ -144,4 +183,148 @@ func run(logger *slog.Logger) error {
 		}
 		return nil
 	}
+}
+
+// reconciler bundles the purchase-saga recovery sweep dependencies.
+type reconciler struct {
+	service       *ticketing.Service
+	ledgerClient  tigerbeetle.Client
+	interval      time.Duration
+	completionAge time.Duration
+	expiryAge     time.Duration
+	batch         int
+}
+
+func (reconciler *reconciler) close() {
+	reconciler.ledgerClient.Close()
+}
+
+// run sweeps on a ticker until the process shuts down. Sweep failures are
+// logged and retried on the next tick: every recovery step is
+// idempotent-safe, so a partial sweep never strands state.
+func (reconciler *reconciler) run(ctx context.Context, logger *slog.Logger) {
+	ticker := time.NewTicker(reconciler.interval)
+	defer ticker.Stop()
+	logger.Info("purchase-saga reconciler starting",
+		"interval", reconciler.interval.String(),
+		"completion_age", reconciler.completionAge.String(),
+		"expiry_age", reconciler.expiryAge.String(),
+		"batch", reconciler.batch)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report, err := reconciler.service.Reconcile(ctx, reconciler.completionAge, reconciler.expiryAge, reconciler.batch)
+			if err != nil {
+				logger.Error("reconciler sweep failed", "error", err.Error())
+				continue
+			}
+			if report.Completed > 0 || report.Expired > 0 || report.Failed > 0 {
+				logger.Info("reconciler sweep",
+					"completed", report.Completed, "expired", report.Expired,
+					"pending", report.Pending, "failed", report.Failed)
+			}
+		}
+	}
+}
+
+// configureReconciler loads the TigerBeetle topology and sweep cadence from
+// the environment. The ledger is fail-closed: the worker refuses to start
+// without it, mirroring ferry-api. FERRY_SWEEP_INTERVAL_SECONDS (default 60)
+// and FERRY_SWEEP_COMPLETION_AGE_SECONDS (default 60) tune the cadence; the
+// expiry age is the ledger pending timeout plus a fixed 30-second grace so a
+// reservation is only expired after TigerBeetle has auto-voided its reserve.
+func configureReconciler(store *ticketing.PostgresStore) (*reconciler, error) {
+	address, err := required("FERRY_TB_ADDRESS")
+	if err != nil {
+		return nil, err
+	}
+	clusterID, err := requiredUint32("FERRY_TB_CLUSTER_ID")
+	if err != nil {
+		return nil, err
+	}
+	ledgerID, err := requiredUint32("FERRY_TB_LEDGER")
+	if err != nil {
+		return nil, err
+	}
+	code, err := requiredUint32("FERRY_TB_CODE")
+	if err != nil {
+		return nil, err
+	}
+	if code > 65535 {
+		return nil, errors.New("FERRY_TB_CODE must fit a uint16")
+	}
+	clearing, err := required("FERRY_TB_PASSENGER_CLEARING_ACCOUNT")
+	if err != nil {
+		return nil, err
+	}
+	revenue, err := required("FERRY_TB_OPERATOR_REVENUE_ACCOUNT")
+	if err != nil {
+		return nil, err
+	}
+	agentFloat, err := required("FERRY_TB_AGENT_FLOAT_ACCOUNT")
+	if err != nil {
+		return nil, err
+	}
+	pendingTimeout, err := requiredUint32("FERRY_TB_PENDING_TIMEOUT_SECONDS")
+	if err != nil {
+		return nil, err
+	}
+	manifestSalt, err := required("FERRY_MANIFEST_SALT")
+	if err != nil {
+		return nil, err
+	}
+
+	clearingID, err := ledger.ParseID(clearing)
+	if err != nil {
+		return nil, fmt.Errorf("FERRY_TB_PASSENGER_CLEARING_ACCOUNT: %w", err)
+	}
+	revenueID, err := ledger.ParseID(revenue)
+	if err != nil {
+		return nil, fmt.Errorf("FERRY_TB_OPERATOR_REVENUE_ACCOUNT: %w", err)
+	}
+	agentFloatID, err := ledger.ParseID(agentFloat)
+	if err != nil {
+		return nil, fmt.Errorf("FERRY_TB_AGENT_FLOAT_ACCOUNT: %w", err)
+	}
+	tbClient, err := tigerbeetle.NewClient(tigerbeetle.ToUint128(uint64(clusterID)), []string{address})
+	if err != nil {
+		return nil, fmt.Errorf("connect TigerBeetle: %w", err)
+	}
+	ledgerService, err := ledger.New(tbClient, ledger.Topology{
+		Ledger:                   ledgerID,
+		Code:                     uint16(code),
+		PassengerClearingAccount: clearingID,
+		OperatorRevenueAccount:   revenueID,
+		AgentFloatAccount:        agentFloatID,
+		PendingTimeoutSeconds:    pendingTimeout,
+	})
+	if err != nil {
+		tbClient.Close()
+		return nil, fmt.Errorf("configure ledger: %w", err)
+	}
+	ticketService, err := ticketing.NewService(store, ledgerService, manifestSalt)
+	if err != nil {
+		tbClient.Close()
+		return nil, err
+	}
+	interval, err := optionalDurationSeconds("FERRY_SWEEP_INTERVAL_SECONDS", 60*time.Second)
+	if err != nil {
+		tbClient.Close()
+		return nil, err
+	}
+	completionAge, err := optionalDurationSeconds("FERRY_SWEEP_COMPLETION_AGE_SECONDS", 60*time.Second)
+	if err != nil {
+		tbClient.Close()
+		return nil, err
+	}
+	return &reconciler{
+		service:       ticketService,
+		ledgerClient:  tbClient,
+		interval:      interval,
+		completionAge: completionAge,
+		expiryAge:     time.Duration(pendingTimeout)*time.Second + 30*time.Second,
+		batch:         100,
+	}, nil
 }
