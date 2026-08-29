@@ -202,9 +202,10 @@ type fakeLedger struct {
 	posted     []string
 	voided     []string
 	refunded   []string
-	reserveErr error
-	postErr    error
-	resolveErr error
+	reserveErr      error
+	postErr         error
+	resolveErr      error
+	refundedAmounts []int64
 	// timedOut simulates pending reserves auto-voided by the TigerBeetle
 	// pending-transfer timeout (no void transfer is recorded cluster-side).
 	timedOut map[string]bool
@@ -237,10 +238,11 @@ func (ledger *fakeLedger) Void(_ context.Context, reserveID string) error {
 	return nil
 }
 
-func (ledger *fakeLedger) Refund(_ context.Context, ticketID string, _ int64) (string, error) {
+func (ledger *fakeLedger) Refund(_ context.Context, ticketID string, amount int64) (string, error) {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	ledger.refunded = append(ledger.refunded, ticketID)
+	ledger.refundedAmounts = append(ledger.refundedAmounts, amount)
 	return "refund-" + ticketID, nil
 }
 
@@ -386,9 +388,42 @@ func TestRefundTransitionsAndPostsRefund(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StateRefunded, refunded.State)
 	require.Len(t, ledger.refunded, 1)
+	require.Equal(t, []int64{ticket.FareNGNMinor}, ledger.refundedAmounts, "balanced: the refund moves exactly the fare back")
 	// Terminal: a second refund fails closed.
 	_, err = service.Refund(context.Background(), ticket.TicketID, "subject-1", "passenger", "corr-refund-2")
 	require.ErrorIs(t, err, ErrInvalidTransition)
+}
+
+// TestRefundBoardedTicketRejected is the FE-3 regression: a ticket whose
+// boarding was consumed can never be refunded — no ledger movement, no state
+// change — regardless of whether the boarding is observed via boarded_at or
+// the embarked flag.
+func TestRefundBoardedTicketRejected(t *testing.T) {
+	service, store, ledger := seededService(t)
+	ticket, err := service.Purchase(context.Background(), purchaseRequest("key-1"))
+	require.NoError(t, err)
+	require.Equal(t, StateIssued, ticket.State)
+
+	// First-scan-wins boarding record consumed.
+	now := time.Now().UTC()
+	boarded, _ := store.GetTicket(context.Background(), ticket.TicketID)
+	boarded.Embarked = true
+	boarded.BoardedAt = &now
+	boarded.BoardedBy = "gate-1"
+	store.tickets[ticket.TicketID] = boarded
+
+	_, err = service.Refund(context.Background(), ticket.TicketID, "subject-1", "passenger", "corr-refund")
+	require.ErrorIs(t, err, ErrTicketBoarded)
+	require.Empty(t, ledger.refunded, "no refund transfer for a traveled passenger")
+	unchanged, _ := store.GetTicket(context.Background(), ticket.TicketID)
+	require.Equal(t, StateIssued, unchanged.State)
+
+	// boarded_at alone (embarked flag cleared by a partial migration) also blocks.
+	boarded.Embarked = false
+	store.tickets[ticket.TicketID] = boarded
+	_, err = service.Refund(context.Background(), ticket.TicketID, "subject-1", "passenger", "corr-refund")
+	require.ErrorIs(t, err, ErrTicketBoarded)
+	require.Empty(t, ledger.refunded)
 }
 
 // TestPurchaseReplayResumesInterruptedSaga proves the FE-1 retry-convergence

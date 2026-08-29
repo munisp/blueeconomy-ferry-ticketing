@@ -46,6 +46,11 @@ var (
 	ErrCapacityExceeded = errors.New("trip capacity is fully reserved")
 	// ErrIdempotencyConflict reports a key replay against a different ticket.
 	ErrIdempotencyConflict = errors.New("idempotency key is bound to a different ticket")
+	// ErrTicketBoarded rejects any refund/void of a ticket whose boarding was
+	// consumed: the passenger traveled, so the fare is earned. Enforced in
+	// the service guard and by the tickets_block_boarded_refund trigger so no
+	// code path can bypass it.
+	ErrTicketBoarded = errors.New("ticket boarding has been consumed; refund and void are not permitted")
 )
 
 // transitions is the complete, approved state graph. Anything not listed

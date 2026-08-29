@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,8 +175,23 @@ func openIntegrationPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
-	for _, migrationFile := range []string{"0001_ferry_ticketing.sql", "0002_signed_tickets.sql"} {
-		migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", migrationFile)))
+	migrationDir := filepath.Clean(filepath.Join("..", "..", "db", "migrations"))
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		t.Fatalf("list migrations: %v", err)
+	}
+	migrations := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			migrations = append(migrations, entry.Name())
+		}
+	}
+	sort.Strings(migrations)
+	if len(migrations) == 0 {
+		t.Fatal("no migrations found")
+	}
+	for _, migrationFile := range migrations {
+		migration, err := os.ReadFile(filepath.Clean(filepath.Join(migrationDir, migrationFile)))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", migrationFile, err)
 		}
@@ -338,6 +355,51 @@ func TestSeatReleaseOnTerminalTransitionIntegration(t *testing.T) {
 	}
 	if got := seats(); got != 0 {
 		t.Fatalf("seats_reserved after expiry = %d, expected 0", got)
+	}
+}
+
+// TestBoardedRefundGuardIntegration proves the FE-3 database backstop: the
+// tickets_block_boarded_refund trigger rejects any UPDATE moving a boarded
+// ticket to REFUNDED or VOID — including ad-hoc SQL that bypasses every
+// service guard — while an unboarded ISSUED ticket refunds normally.
+func TestBoardedRefundGuardIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool := openIntegrationPool(t, ctx)
+	defer pool.Close()
+
+	seedTrip(t, ctx, pool, "op-int", "vessel-int", "trip-int", 2)
+	insertIssued := func(ticketID string, boarded bool) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO tickets (ticket_id, trip_id, operator_id, passenger_digest_sha256, fare_ngn_minor,
+			     channel, state, purchaser_principal, correlation_id, embarked, boarded_at, boarded_by)
+			 VALUES ($1, 'trip-int', 'op-int', $2, 250000, 'DIRECT', 'ISSUED', 'kc-integration-buyer', 'corr-int-b',
+			         $3, CASE WHEN $3 THEN now() END, CASE WHEN $3 THEN 'gate-1' END)`,
+			ticketID, "sha256:"+ticketID+ticketID+ticketID, boarded); err != nil {
+			t.Fatalf("insert issued ticket %s: %v", ticketID, err)
+		}
+	}
+	insertIssued("ticket-b-1", true)
+	insertIssued("ticket-b-2", false)
+
+	// Boarded: REFUNDED and VOID are rejected at the database layer.
+	for _, target := range []string{"REFUNDED", "VOID"} {
+		_, err := pool.Exec(ctx, `UPDATE tickets SET state = $2 WHERE ticket_id = $1`, "ticket-b-1", target)
+		if err == nil || !strings.Contains(err.Error(), "consumed boarding") {
+			t.Fatalf("boarded ticket -> %s: err = %v, expected trigger rejection", target, err)
+		}
+	}
+	// Embarked flag alone (no boarded_at) is also a consumed boarding.
+	if _, err := pool.Exec(ctx, `UPDATE tickets SET boarded_at = NULL WHERE ticket_id = 'ticket-b-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tickets SET state = 'REFUNDED' WHERE ticket_id = 'ticket-b-1'`); err == nil {
+		t.Fatal("embarked ticket without boarded_at must also be rejected")
+	}
+
+	// Unboarded ISSUED refunds normally.
+	if _, err := pool.Exec(ctx, `UPDATE tickets SET state = 'REFUNDED' WHERE ticket_id = 'ticket-b-2'`); err != nil {
+		t.Fatalf("unboarded ticket refund must succeed: %v", err)
 	}
 }
 

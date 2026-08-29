@@ -51,6 +51,7 @@ type fakeTicketService struct {
 	purchased []ticketing.PurchaseRequest
 	ticket    ticketing.Ticket
 	err       error
+	refundErr error
 }
 
 func (service *fakeTicketService) Purchase(_ context.Context, request ticketing.PurchaseRequest) (ticketing.Ticket, error) {
@@ -62,6 +63,9 @@ func (service *fakeTicketService) Purchase(_ context.Context, request ticketing.
 }
 
 func (service *fakeTicketService) Refund(_ context.Context, ticketID, principal, principalRole, correlationID string) (ticketing.Ticket, error) {
+	if service.refundErr != nil {
+		return ticketing.Ticket{}, service.refundErr
+	}
 	return ticketing.Ticket{TicketID: ticketID, State: ticketing.StateRefunded}, nil
 }
 
@@ -323,6 +327,17 @@ func TestPurchaseRequiresIdempotencyKey(t *testing.T) {
 	server.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 	require.Empty(t, tickets.purchased)
+}
+
+// TestRefundBoardedTicketConflict is the FE-3 edge regression: a refund
+// request for a boarding-consumed ticket maps to 409, never a silent 200.
+func TestRefundBoardedTicketConflict(t *testing.T) {
+	server, tickets, _, _, _ := newTestServer(t)
+	tickets.refundErr = ticketing.ErrTicketBoarded
+	request := withAuth(httptest.NewRequest(http.MethodPost, "/v1/tickets/ticket-1/refund", nil), passengerPrincipal())
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusConflict, recorder.Code)
 }
 
 func TestPurchaseHappyPath(t *testing.T) {

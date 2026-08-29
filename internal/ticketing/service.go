@@ -306,7 +306,10 @@ func (ticket Ticket) SeatNumberValue() int {
 	return *ticket.SeatNumber
 }
 
-// Refund returns the fare and moves the ticket to REFUNDED.
+// Refund returns the fare and moves the ticket to REFUNDED. A ticket whose
+// boarding was consumed (boarded_at set or embarked) can never be refunded:
+// the passenger traveled and the fare is earned. The guard is mirrored by the
+// tickets_block_boarded_refund database trigger so no code path bypasses it.
 func (service *Service) Refund(ctx context.Context, ticketID, principal, principalRole, correlationID string) (Ticket, error) {
 	ticket, err := service.store.GetTicket(ctx, ticketID)
 	if err != nil {
@@ -314,6 +317,9 @@ func (service *Service) Refund(ctx context.Context, ticketID, principal, princip
 	}
 	if !ValidTransition(ticket.State, StateRefunded) {
 		return Ticket{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, ticket.State, StateRefunded)
+	}
+	if ticket.BoardedAt != nil || ticket.Embarked {
+		return Ticket{}, ErrTicketBoarded
 	}
 	traceTicketTransition(ctx, ticket, StateRefunded)
 	refundID, err := service.ledger.Refund(ctx, ticket.TicketID, ticket.FareNGNMinor)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -65,8 +66,23 @@ func TestDrainAgainstLivePostgresAndKafka(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
-	for _, migrationFile := range []string{"0001_ferry_ticketing.sql", "0002_signed_tickets.sql"} {
-		migration, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "db", "migrations", migrationFile)))
+	migrationDir := filepath.Clean(filepath.Join("..", "..", "db", "migrations"))
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		t.Fatalf("list migrations: %v", err)
+	}
+	migrations := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			migrations = append(migrations, entry.Name())
+		}
+	}
+	sort.Strings(migrations)
+	if len(migrations) == 0 {
+		t.Fatal("no migrations found")
+	}
+	for _, migrationFile := range migrations {
+		migration, err := os.ReadFile(filepath.Clean(filepath.Join(migrationDir, migrationFile)))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", migrationFile, err)
 		}

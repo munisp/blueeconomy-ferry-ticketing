@@ -260,6 +260,8 @@ func writeDomainError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusUnauthorized, "ticket artifact verification failed")
 	case errors.Is(err, ticketing.ErrInvalidTransition):
 		writeError(writer, http.StatusConflict, "state transition is not permitted")
+	case errors.Is(err, ticketing.ErrTicketBoarded):
+		writeError(writer, http.StatusConflict, "ticket boarding has been consumed; refund is not permitted")
 	case errors.Is(err, ticketing.ErrIdempotencyConflict):
 		writeError(writer, http.StatusConflict, "idempotency key conflict")
 	default:
