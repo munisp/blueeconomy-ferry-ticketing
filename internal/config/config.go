@@ -43,6 +43,12 @@ type Config struct {
 	// Unset means 0: dual control for every PAID/ISSUED void (fail closed).
 	VoidDualControlThresholdNGNMinor int64
 
+	// AllowLegacyUnsignedEmbark opts the deployment into the deprecated
+	// legacy raw-ticket-id embark path. Default off: gates must present
+	// signed ticket artifacts. Sunset: the path is scheduled for removal
+	// once all gates scan signed artifacts.
+	AllowLegacyUnsignedEmbark bool
+
 	TicketSigningKeyFile         string
 	TicketPreviousSigningKeyFile string
 	TicketPreviousKeyGraceUntil  time.Time
@@ -136,6 +142,16 @@ func Load() (Config, error) {
 			return Config{}, errors.New("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR must be a non-negative integer")
 		}
 		config.VoidDualControlThresholdNGNMinor = parsed
+	}
+	// Optional security knob; only an explicit "true" relaxes the default
+	// signed-artifact-only posture, anything malformed fails closed.
+	switch legacy := strings.ToLower(strings.TrimSpace(os.Getenv("FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK"))); legacy {
+	case "", "false":
+		config.AllowLegacyUnsignedEmbark = false
+	case "true":
+		config.AllowLegacyUnsignedEmbark = true
+	default:
+		return Config{}, errors.New("FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK must be \"true\" or \"false\"")
 	}
 	if err := config.loadTicketProof(); err != nil {
 		return Config{}, err

@@ -20,6 +20,11 @@ const (
 	// EventTicketDuplicatePresentation audits a second presentation of an
 	// already-consumed boarding (first-scan-wins).
 	EventTicketDuplicatePresentation = "ferry.ticket.duplicate_presentation"
+	// EventBoardingLegacyUnsigned audits a boarding consumed through the
+	// legacy raw-ticket-id path (opt-in per operator deployment). The
+	// payload marker boarding_mode=LEGACY_UNSIGNED lets the security-operations
+	// engine track the deprecation burn-down to the sunset date.
+	EventBoardingLegacyUnsigned = "ferry.boarding.legacy_unsigned"
 )
 
 var (
@@ -30,6 +35,11 @@ var (
 	// ErrBoardingAlreadyConsumed rejects the second presentation of a
 	// boarded ticket (HTTP 409 BOARDING_ALREADY_CONSUMED).
 	ErrBoardingAlreadyConsumed = errors.New("boarding has already been consumed")
+	// ErrLegacyEmbarkDisabled rejects the legacy raw-ticket-id embark path
+	// when the operator has not explicitly opted in
+	// (FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK). Default posture: signed ticket
+	// artifacts only.
+	ErrLegacyEmbarkDisabled = errors.New("legacy unsigned embark is disabled")
 )
 
 // BoardingStore is the persistence boundary for artifact minting and
@@ -52,6 +62,26 @@ type BoardingService struct {
 	keys     *ticketproof.KeySet
 	verifier *ticketproof.Verifier
 	now      func() time.Time
+	// allowLegacyUnsigned gates the deprecated raw-ticket-id embark path.
+	// Default off; operators opt in explicitly via
+	// FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK (sunset: the path is scheduled for
+	// removal once all gates scan signed artifacts).
+	allowLegacyUnsigned bool
+}
+
+// BoardingOption tunes optional boarding behaviour. Security knobs fail
+// closed by default and only relax via explicit configuration.
+type BoardingOption func(*BoardingService) error
+
+// WithLegacyUnsignedEmbark opts the deployment into the deprecated legacy
+// raw-ticket-id embark path (default off). Even when enabled, ticket state
+// and operator scope are still verified atomically, and every legacy
+// boarding emits a LEGACY_UNSIGNED audit event.
+func WithLegacyUnsignedEmbark(enabled bool) BoardingOption {
+	return func(service *BoardingService) error {
+		service.allowLegacyUnsigned = enabled
+		return nil
+	}
 }
 
 // Artifact is the minted, QR-encodable signed ticket payload.
@@ -67,7 +97,7 @@ type Artifact struct {
 }
 
 // NewBoardingService fails closed on any missing dependency.
-func NewBoardingService(store BoardingStore, keys *ticketproof.KeySet, windowSecret string) (*BoardingService, error) {
+func NewBoardingService(store BoardingStore, keys *ticketproof.KeySet, windowSecret string, options ...BoardingOption) (*BoardingService, error) {
 	if store == nil {
 		return nil, errors.New("boarding store is required")
 	}
@@ -81,10 +111,16 @@ func NewBoardingService(store BoardingStore, keys *ticketproof.KeySet, windowSec
 	if err != nil {
 		return nil, err
 	}
-	return &BoardingService{
+	service := &BoardingService{
 		store: store, keys: keys, verifier: verifier,
 		now: func() time.Time { return time.Now().UTC() },
-	}, nil
+	}
+	for _, option := range options {
+		if err := option(service); err != nil {
+			return nil, err
+		}
+	}
+	return service, nil
 }
 
 // MintArtifact produces the signed artifact for an ISSUED ticket. The
@@ -158,14 +194,20 @@ func (service *BoardingService) VerifyArtifact(ctx context.Context, token, princ
 // Embark consumes one boarding first-scan-wins. With an artifact the
 // presentation is verified cryptographically before the atomic consume; the
 // artifact's ticket_id must match the path ticket. The legacy path (empty
-// artifact) consumes by raw ticket id only and is retained for backward
-// compatibility. A second presentation — concurrent or later — returns
-// ErrBoardingAlreadyConsumed and emits TicketDuplicatePresentation.
+// artifact) is deprecated and disabled unless the operator explicitly opted
+// in; when enabled it still verifies ticket state and operator scope
+// atomically and emits a LEGACY_UNSIGNED audit event. A second
+// presentation — concurrent or later — returns ErrBoardingAlreadyConsumed
+// and emits TicketDuplicatePresentation.
 func (service *BoardingService) Embark(ctx context.Context, operatorID, ticketID, artifact, principal, correlationID string) (Ticket, error) {
 	if operatorID == "" || ticketID == "" || principal == "" {
 		return Ticket{}, errors.New("operator id, ticket id and boarding principal are required")
 	}
 	artifactKid := ""
+	legacy := artifact == ""
+	if legacy && !service.allowLegacyUnsigned {
+		return Ticket{}, ErrLegacyEmbarkDisabled
+	}
 	if artifact != "" {
 		payload, err := service.verifier.Verify(artifact, service.now())
 		if err != nil {
@@ -188,6 +230,15 @@ func (service *BoardingService) Embark(ctx context.Context, operatorID, ticketID
 	}
 	if !consumed {
 		return Ticket{}, service.boardingRejected(ctx, operatorID, ticketID, artifactKid, principal, correlationID)
+	}
+	if legacy {
+		// Audit every unsigned boarding so the deprecation burn-down to the
+		// sunset date is measurable; emission failure never masks the
+		// boarding decision (already consumed atomically above).
+		service.emitFraudEvent(ctx, EventBoardingLegacyUnsigned, ticketID, "", artifactKid, principal, correlationID, map[string]any{
+			"boarding_mode": "LEGACY_UNSIGNED",
+			"operator_id":   operatorID,
+		})
 	}
 	return service.store.GetTicket(ctx, ticketID)
 }

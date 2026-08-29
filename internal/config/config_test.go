@@ -67,6 +67,33 @@ func TestVoidDualControlThresholdDefaultsFailClosed(t *testing.T) {
 	require.Error(t, err, "malformed threshold fails closed")
 }
 
+// TestLegacyUnsignedEmbarkOptIn pins the FE-8 knob: only an explicit "true"
+// relaxes the signed-artifact-only posture; unset/false is off and anything
+// malformed fails closed.
+func TestLegacyUnsignedEmbarkOptIn(t *testing.T) {
+	validEnv(t)
+	config, err := Load()
+	require.NoError(t, err)
+	require.False(t, config.AllowLegacyUnsignedEmbark, "legacy embark is off by default")
+
+	validEnv(t)
+	t.Setenv("FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK", "true")
+	config, err = Load()
+	require.NoError(t, err)
+	require.True(t, config.AllowLegacyUnsignedEmbark)
+
+	validEnv(t)
+	t.Setenv("FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK", "false")
+	config, err = Load()
+	require.NoError(t, err)
+	require.False(t, config.AllowLegacyUnsignedEmbark)
+
+	validEnv(t)
+	t.Setenv("FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK", "yes")
+	_, err = Load()
+	require.Error(t, err, "malformed opt-in fails closed")
+}
+
 func TestLoadFailsClosedOnMissingValues(t *testing.T) {
 	validEnv(t)
 	t.Setenv("FERRY_DATABASE_URL", "")

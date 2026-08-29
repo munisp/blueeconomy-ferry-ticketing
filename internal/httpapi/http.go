@@ -268,6 +268,8 @@ func writeDomainError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusConflict, "ticket boarding has been consumed; refund is not permitted")
 	case errors.Is(err, ticketing.ErrVoidApprovalRequired):
 		writeError(writer, http.StatusConflict, "void requires a second officer approval")
+	case errors.Is(err, ticketing.ErrLegacyEmbarkDisabled):
+		writeError(writer, http.StatusForbidden, "legacy unsigned embark is disabled; present a signed ticket artifact")
 	case errors.Is(err, ticketing.ErrIdempotencyConflict):
 		writeError(writer, http.StatusConflict, "idempotency key conflict")
 	default:

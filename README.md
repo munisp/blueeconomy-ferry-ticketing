@@ -45,7 +45,29 @@ credentials.
   agent float account and records a `cash_in_events` ledger event plus the
   `ferry.agent.cash_in_recorded` outbox event.
 - Refund posts a compensating TigerBeetle transfer from operator revenue back
-  to passenger clearing; void releases the pending reserve.
+  to passenger clearing. A boarding-consumed ticket (`boarded_at` set or
+  `embarked`) can never be refunded or voided — enforced in the service guard
+  and by the `tickets_block_boarded_refund` database trigger, so no code path
+  can refund a traveled passenger.
+- Void money semantics by state: `RESERVED → VOID` releases the pending
+  reserve (the passenger was never charged); `PAID/ISSUED → VOID` issues the
+  refund transfer (revenue → clearing) in the same flow, so the fare never
+  sits in revenue without a refund entry. Voiding a sold ticket at or above
+  `FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR` (kobo; unset = 0, i.e. dual
+  control on every sold void) requires maker-checker: the first officer's
+  void records a `void_approvals` row (409 `VOID_APPROVAL_REQUIRED`), and
+  only a second, distinct officer's void confirms it — self-approval is
+  rejected and the approval is consumed exactly once.
+- Any terminal transition (`REFUNDED`/`EXPIRED`/`VOID`) releases the seat in
+  the same transaction (`seats_reserved` decrement, exactly-once by the state
+  graph + optimistic-concurrency guard), so refunded/voided/expired tickets
+  never leave a trip reading full.
+- The purchase saga cannot strand state: an idempotent replay resumes from
+  the stored ticket state, and the `ferry-worker` reconciler sweeps aged
+  `RESERVED`/`PAID` tickets against the TigerBeetle reserve state — a posted
+  charge is driven to `PAID`/`ISSUED`, a reserve auto-voided by the pending
+  timeout expires the ticket (`EXPIRED`) and frees the seat, and a
+  paid-but-unissued ticket finishes issuance.
 - Passengers are never stored as raw PII: tickets carry an HMAC-SHA256 salted
   digest (`FERRY_MANIFEST_SALT`) of the tokenized passenger reference.
 
@@ -153,9 +175,14 @@ reason, kid and correlation id — never PII.
 | `POST /v1/operator/tickets/{id}/embark` | Consume boarding with `{"artifact": "…"}`; first-scan-wins, `409 BOARDING_ALREADY_CONSUMED` on replay. |
 
 The embark body is optional: an empty body is the **legacy** raw-ticket-id
-path, retained for backward compatibility. It goes through the same atomic
-first-scan-wins guard, is logged with a `legacy` warning, and gates should
-migrate to signed artifacts.
+path, **deprecated and disabled by default** (`403` —
+`ErrLegacyEmbarkDisabled`). An operator deployment may explicitly opt in with
+`FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK=true`; even then the path goes through
+the same atomic first-scan-wins guard and operator-scope check, every legacy
+boarding emits a `ferry.boarding.legacy_unsigned` audit event marked
+`boarding_mode: LEGACY_UNSIGNED`, and each use is logged with a deprecation
+warning. Sunset: the legacy path is scheduled for removal once all gates
+scan signed artifacts; the audit stream tracks the burn-down.
 
 
 ## NIMASA manifest API
@@ -192,6 +219,7 @@ the service/DB layer, not only at the edge).
 | `GET /v1/operator/vessels`, `GET/PATCH/DELETE /v1/operator/vessels/{id}` | Vessel registry CRUD. Delete fails closed when trips exist. |
 | `POST /v1/operator/trips` | Schedule a departure; capacity is snapshotted from the vessel. |
 | `GET /v1/operator/trips` | List trips. |
+| `POST /v1/operator/trips/{id}/cancel` | Cancel an open trip (`SCHEDULED`/`BOARDING_PAUSED` → `CANCELLED`, operator-scoped, audited via `ferry.trip.cancelled`). Ticket refunds for a cancelled trip are a separate explicit flow. |
 | `POST /v1/operator/tickets/{id}/embark` | Consume boarding first-scan-wins (signed artifact default; legacy raw-id path deprecated). |
 | `GET /v1/operator/dashboard` | Tickets sold, revenue (NGN minor), per-corridor stats, manifest completeness vs KPI. |
 
@@ -213,6 +241,10 @@ from issuance to departure:
 - an `ferry.adverse-weather` signal always emits an `AdverseWeatherAlert`
   event to the NIMASA topic; within 30 minutes of departure it additionally
   pauses boarding (`BOARDING_PAUSED`);
+- at the departure instant an idempotent activity persists the `DEPARTED`
+  trip status, so historical trips never claim `SCHEDULED` forever (operator
+  cancellation persists `CANCELLED` via
+  `POST /v1/operator/trips/{id}/cancel`);
 - departure without a manifest fails closed and is audited
   (`ferry.manifest.incomplete`);
 - `ferry.status` query exposes phase, readiness flags, boarding state and
@@ -276,11 +308,21 @@ events are `INTERNAL`.
 | `FERRY_TICKET_PREVIOUS_SIGNING_KEY_FILE` | Optional previous key, accepted during the rotation grace window. |
 | `FERRY_TICKET_PREVIOUS_KEY_GRACE_UNTIL` | RFC3339 grace deadline; required when a previous key is configured. |
 | `FERRY_TICKET_ROTATION_EPOCH` | Signing-key epoch (uint32 ≥ 1; default 1, increment per rotation). |
+| `FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR` | Optional. Fare (kobo) at or above which voiding a sold ticket requires a second officer (maker-checker). Unset = 0: dual control on every `PAID`/`ISSUED` void (fail closed). |
+| `FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK` | Optional, default `false`. Only an explicit `true` enables the deprecated legacy raw-ticket-id embark path (audited as `LEGACY_UNSIGNED`; scheduled for removal). |
 
 ### `ferry-worker`
 
 `FERRY_DATABASE_URL`, `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
-`TEMPORAL_TASK_QUEUE` (all required).
+`TEMPORAL_TASK_QUEUE` (all required). The worker also hosts the
+purchase-saga reconciler, which needs the TigerBeetle topology
+(`FERRY_TB_ADDRESS`, `FERRY_TB_CLUSTER_ID`, `FERRY_TB_LEDGER`,
+`FERRY_TB_CODE`, `FERRY_TB_PASSENGER_CLEARING_ACCOUNT`,
+`FERRY_TB_OPERATOR_REVENUE_ACCOUNT`, `FERRY_TB_AGENT_FLOAT_ACCOUNT`,
+`FERRY_TB_PENDING_TIMEOUT_SECONDS` — all required, fail-closed) and
+`FERRY_MANIFEST_SALT`. Sweep cadence: `FERRY_SWEEP_INTERVAL_SECONDS`
+(default 60) and `FERRY_SWEEP_COMPLETION_AGE_SECONDS` (default 60); the
+expiry age is the pending-transfer timeout plus a fixed 30-second grace.
 
 ### `outbox-publisher`
 
@@ -324,13 +366,20 @@ events are `INTERNAL`.
 `version`), purchase idempotency keys, cash-in events, manifests and the
 transactional outbox. `db/migrations/0002_signed_tickets.sql` adds the
 first-scan-wins boarding columns (`boarded_at`, `boarded_by`, `artifact_kid`)
-and backfills pre-existing embarked tickets so the guard covers them. All
+and backfills pre-existing embarked tickets so the guard covers them.
+`db/migrations/0003_boarded_refund_guard.sql` adds the
+`tickets_block_boarded_refund` trigger (a boarding-consumed ticket can never
+reach `REFUNDED`/`VOID`, from any code path).
+`db/migrations/0004_void_approvals.sql` adds the `void_approvals`
+maker-checker table for dual-control voids of sold tickets. All
 queries are parameterized.
 
 ## Runbook
 
-1. Apply `db/migrations/0001_ferry_ticketing.sql` and
-   `db/migrations/0002_signed_tickets.sql` to the service database.
+1. Apply `db/migrations/0001_ferry_ticketing.sql`,
+   `db/migrations/0002_signed_tickets.sql`,
+   `db/migrations/0003_boarded_refund_guard.sql` and
+   `db/migrations/0004_void_approvals.sql` to the service database.
 2. Provision the ticket signing key: `ticket-keygen /run/secrets/ticket-signing-key`
    (or generate externally) and set `FERRY_TICKET_SIGNING_KEY_FILE` +
    `FERRY_TICKET_WINDOW_SECRET`. Distribute the printed public key/kid to

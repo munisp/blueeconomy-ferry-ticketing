@@ -350,7 +350,9 @@ func (server *Server) embarkTicket(writer http.ResponseWriter, request *http.Req
 	}
 	resolved, _ := auth.PrincipalFrom(request.Context())
 	// The signed-artifact path is the default; an empty body is the legacy
-	// raw-ticket-id path, retained for backward compatibility.
+	// raw-ticket-id path. The legacy path is deprecated (sunset: removal
+	// once all gates scan signed artifacts) and rejected with 403 unless the
+	// deployment explicitly opted in via FERRY_ALLOW_LEGACY_UNSIGNED_EMBARK.
 	var body embarkRequestBody
 	artifact := ""
 	if request.Body != nil && request.ContentLength != 0 {
@@ -360,7 +362,7 @@ func (server *Server) embarkTicket(writer http.ResponseWriter, request *http.Req
 		artifact = strings.TrimSpace(body.Artifact)
 	}
 	if artifact == "" {
-		server.logger.Warn("legacy raw-ticket-id embark used; migrate gates to signed artifacts",
+		server.logger.Warn("legacy raw-ticket-id embark used (DEPRECATED, scheduled for removal at the legacy-embark sunset); migrate gates to signed artifacts",
 			"ticket_id", request.PathValue("id"), "operator_id", operatorID, "correlation_id", correlationID(request))
 	}
 	ticket, err := server.boarding.Embark(request.Context(), operatorID, request.PathValue("id"), artifact, resolved.Subject, correlationID(request))

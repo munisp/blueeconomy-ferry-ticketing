@@ -188,7 +188,8 @@ func configureBoarding(cfg config.Config, store *ticketing.PostgresStore) (*tick
 	if err != nil {
 		return nil, fmt.Errorf("configure ticket signing keys: %w", err)
 	}
-	boarding, err := ticketing.NewBoardingService(store, keySet, cfg.TicketWindowSecret)
+	boarding, err := ticketing.NewBoardingService(store, keySet, cfg.TicketWindowSecret,
+		ticketing.WithLegacyUnsignedEmbark(cfg.AllowLegacyUnsignedEmbark))
 	if err != nil {
 		return nil, fmt.Errorf("configure boarding service: %w", err)
 	}

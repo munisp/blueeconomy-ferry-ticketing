@@ -247,18 +247,49 @@ func TestEmbarkRejectsInvalidArtifactsWithTelemetry(t *testing.T) {
 	require.Nil(t, ticket.BoardedAt)
 }
 
+// TestEmbarkLegacyRejectedByDefault is the FE-8 regression: the legacy
+// raw-ticket-id path is off unless the operator explicitly opts in; the
+// rejection happens before any boarding is consumed.
+func TestEmbarkLegacyRejectedByDefault(t *testing.T) {
+	service, store, _ := newBoardingFixture(t)
+	_, err := service.Embark(context.Background(), "op-1", "ticket-1", "", "op-subject", "corr-1")
+	require.ErrorIs(t, err, ErrLegacyEmbarkDisabled)
+	ticket, getErr := store.GetTicket(context.Background(), "ticket-1")
+	require.NoError(t, getErr)
+	require.False(t, ticket.Embarked, "no boarding consumed by the rejected legacy path")
+	require.Empty(t, store.fraudEvents(), "no audit noise for a rejected request")
+}
+
+// TestEmbarkLegacyPath pins the opt-in legacy contract: state and operator
+// scope are still verified, first-scan-wins still holds, and the boarding is
+// audited as LEGACY_UNSIGNED.
 func TestEmbarkLegacyPath(t *testing.T) {
-	service, _, _ := newBoardingFixture(t)
-	boarded, err := service.Embark(context.Background(), "op-1", "ticket-1", "", "op-subject", "corr-1")
+	service, store, _ := newBoardingFixture(t)
+	optedIn, err := NewBoardingService(store, service.keys, boardingWindowSecret, WithLegacyUnsignedEmbark(true))
+	require.NoError(t, err)
+	optedIn.now = service.now
+
+	boarded, err := optedIn.Embark(context.Background(), "op-1", "ticket-1", "", "op-subject", "corr-1")
 	require.NoError(t, err)
 	require.True(t, boarded.Embarked)
 	require.Empty(t, boarded.ArtifactKid, "legacy path records no artifact kid")
 
-	_, err = service.Embark(context.Background(), "op-1", "ticket-1", "", "op-subject", "corr-2")
+	legacyEvents := 0
+	for _, event := range store.fraudEvents() {
+		if event.EventType == EventBoardingLegacyUnsigned {
+			legacyEvents++
+			require.Equal(t, "LEGACY_UNSIGNED", event.Payload["boarding_mode"])
+			require.Equal(t, "op-1", event.Payload["operator_id"])
+			require.Equal(t, "op-subject", event.Payload["principal_id"])
+		}
+	}
+	require.Equal(t, 1, legacyEvents, "exactly one LEGACY_UNSIGNED audit event")
+
+	_, err = optedIn.Embark(context.Background(), "op-1", "ticket-1", "", "op-subject", "corr-2")
 	require.ErrorIs(t, err, ErrBoardingAlreadyConsumed)
 
 	// Wrong operator scope: no existence leak.
-	_, err = service.Embark(context.Background(), "op-2", "ticket-1", "", "op-stranger", "corr-3")
+	_, err = optedIn.Embark(context.Background(), "op-2", "ticket-1", "", "op-stranger", "corr-3")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 

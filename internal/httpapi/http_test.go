@@ -240,6 +240,13 @@ func (store *fakeManifestStore) ManifestCompleteness(_ context.Context, operator
 
 func newTestServer(t *testing.T) (*Server, *fakeTicketService, *fakeOperatorStore, *fakeManifestStore, *fakeBoardingStore) {
 	t.Helper()
+	return newTestServerWithBoardingOptions(t)
+}
+
+// newTestServerWithBoardingOptions builds the test server with extra
+// boarding options (e.g. the legacy-embark opt-in).
+func newTestServerWithBoardingOptions(t *testing.T, boardingOptions ...ticketing.BoardingOption) (*Server, *fakeTicketService, *fakeOperatorStore, *fakeManifestStore, *fakeBoardingStore) {
+	t.Helper()
 	tickets := &fakeTicketService{ticket: ticketing.Ticket{
 		TicketID: "ticket-1", TripID: "trip-1", OperatorID: "op-1", State: ticketing.StateIssued,
 		FareNGNMinor: 250000, Channel: ticketing.ChannelDirect, PassengerDigest: strings.Repeat("a", 64),
@@ -261,7 +268,7 @@ func newTestServer(t *testing.T) (*Server, *fakeTicketService, *fakeOperatorStor
 	require.NoError(t, err)
 	keySet, err := ticketproof.NewKeySet(key, 1, nil)
 	require.NoError(t, err)
-	boarding, err := ticketing.NewBoardingService(boardingStore, keySet, "test-window-secret-0123456789")
+	boarding, err := ticketing.NewBoardingService(boardingStore, keySet, "test-window-secret-0123456789", boardingOptions...)
 	require.NoError(t, err)
 	pipeline, err := telemetry.Setup(context.Background(), telemetry.Config{ServiceName: "ferry-httpapi-test"})
 	require.NoError(t, err)
@@ -676,15 +683,41 @@ func TestEmbarkFirstScanWinsRace(t *testing.T) {
 	require.Equal(t, 1, results[http.StatusConflict], "the loser sees 409, got %v", results)
 }
 
+// TestEmbarkLegacyRejectedByDefault is the FE-8 regression: with the default
+// configuration the legacy raw-ticket-id path is forbidden — gates must
+// present signed ticket artifacts.
+func TestEmbarkLegacyRejectedByDefault(t *testing.T) {
+	server, _, _, _, _ := newTestServer(t)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, withAuth(httptest.NewRequest(http.MethodPost, "/v1/operator/tickets/ticket-1/embark", nil), operatorPrincipal()))
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "signed ticket artifact")
+}
+
+// TestEmbarkLegacyPathFlaggedAndGuarded pins the opt-in legacy contract:
+// when explicitly enabled, the legacy path still verifies ticket state and
+// operator scope atomically, marks the boarding LEGACY_UNSIGNED in the audit
+// stream, and the first-scan-wins guard covers it.
 func TestEmbarkLegacyPathFlaggedAndGuarded(t *testing.T) {
-	server, _, _, _, boardingStore := newTestServer(t)
+	server, _, _, _, boardingStore := newTestServerWithBoardingOptions(t, ticketing.WithLegacyUnsignedEmbark(true))
 	operator := operatorPrincipal()
 
-	// Legacy raw-ticket-id embark (no body) still works...
+	// Legacy raw-ticket-id embark (no body) works when opted in...
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, withAuth(httptest.NewRequest(http.MethodPost, "/v1/operator/tickets/ticket-1/embark", nil), operator))
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, recorder.Body.String(), `"embarked":true`)
+
+	// ...and is audited as LEGACY_UNSIGNED for the deprecation burn-down.
+	legacyEvents := 0
+	for _, event := range boardingStore.fraudEvents() {
+		if event.EventType == ticketing.EventBoardingLegacyUnsigned {
+			legacyEvents++
+			require.Equal(t, "LEGACY_UNSIGNED", event.Payload["boarding_mode"])
+			require.Equal(t, "op-subject", event.Payload["principal_id"])
+		}
+	}
+	require.Equal(t, 1, legacyEvents, "exactly one LEGACY_UNSIGNED audit event per legacy boarding")
 
 	// ...and the first-scan-wins guard covers the legacy path too: a signed
 	// artifact presented afterwards is a duplicate.
