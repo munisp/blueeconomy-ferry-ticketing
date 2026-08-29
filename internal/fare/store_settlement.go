@@ -220,6 +220,17 @@ type BestFareAdjustment struct {
 	LedgerTransferID string
 }
 
+// BestFareAdjustmentExists reports whether the subject's period was settled.
+func (store *PostgresStore) BestFareAdjustmentExists(ctx context.Context, subjectRef string, periodStart time.Time) (bool, error) {
+	var exists bool
+	if err := store.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM best_fare_adjustments WHERE subject_ref = $1 AND period_start = $2)`,
+		subjectRef, periodStart).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check best-fare adjustment: %w", err)
+	}
+	return exists, nil
+}
+
 // InsertBestFareAdjustment records one adjustment with its audit event;
 // created is false when the subject's period was already settled.
 func (store *PostgresStore) InsertBestFareAdjustment(ctx context.Context, adjustment BestFareAdjustment, event ticketing.Event) (created bool, err error) {

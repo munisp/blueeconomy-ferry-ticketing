@@ -158,6 +158,7 @@ func (service *PassService) Purchase(ctx context.Context, request PassPurchaseRe
 		AgentID:            request.AgentID,
 		AccountID:          request.AccountID,
 		State:              PurchaseReserved,
+		Version:            1,
 		PurchaserPrincipal: request.Principal,
 		CorrelationID:      request.CorrelationID,
 		IdempotencyKey:     request.IdempotencyKey,

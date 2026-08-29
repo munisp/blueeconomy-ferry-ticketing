@@ -176,7 +176,7 @@ func (service *ValidationService) BlocklistDelta(ctx context.Context, cursor str
 		if err != nil {
 			return BlocklistPage{}, errors.New("blocklist cursor is malformed")
 		}
-		since = time.Unix(unix, 0).UTC()
+		since = time.UnixMicro(unix).UTC()
 		sincePassID = parts[1]
 	}
 	entries, err := service.store.ListRevocationsSince(ctx, since, sincePassID, limit)
@@ -187,9 +187,9 @@ func (service *ValidationService) BlocklistDelta(ctx context.Context, cursor str
 	nextCursor := cursor
 	for _, entry := range entries {
 		passIDs = append(passIDs, entry.PassID)
-		nextCursor = fmt.Sprintf("%d:%s", entry.RevokedAt.Unix(), entry.PassID)
+		nextCursor = fmt.Sprintf("%d:%s", entry.RevokedAt.UnixMicro(), entry.PassID)
 	}
-	signature, err := service.signer.SignBlocklist(since.Unix(), passIDs)
+	signature, err := service.signer.SignBlocklist(since.UnixMicro(), passIDs)
 	if err != nil {
 		return BlocklistPage{}, err
 	}

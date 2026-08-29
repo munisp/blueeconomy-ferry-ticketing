@@ -95,7 +95,10 @@ func (store *PostgresStore) RegisterInstrument(ctx context.Context, instrument I
 // GetFareAccountByInstrument resolves an ACTIVE instrument token to its account.
 func (store *PostgresStore) GetFareAccountByInstrument(ctx context.Context, tokenRef string) (FareAccount, error) {
 	return scanFareAccount(store.pool.QueryRow(ctx,
-		`SELECT `+fareAccountColumns+` FROM fare_accounts a
+		`SELECT a.account_id, a.owner_ref, a.owner_digest, a.status, a.concession_class, a.concession_reference,
+		        a.autoload_enabled, a.autoload_threshold_minor, a.autoload_amount_minor, a.ledger_account_id,
+		        a.cached_balance_minor, a.balance_as_of, a.version, a.created_at, a.updated_at
+		 FROM fare_accounts a
 		 JOIN instruments i ON i.account_id = a.account_id
 		 WHERE i.token_ref = $1 AND i.status = 'ACTIVE'`, tokenRef))
 }

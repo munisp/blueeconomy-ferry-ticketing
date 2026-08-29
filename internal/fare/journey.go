@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
@@ -168,8 +169,20 @@ func (service *JourneyService) Purchase(ctx context.Context, request JourneyPurc
 	if err != nil {
 		return ticketing.Ticket{}, CapJourney{}, fmt.Errorf("price journey: %w", err)
 	}
-	ticket, err := service.bookPriced(ctx, request, trip, digest, journey, account)
-	if err != nil {
+	// The pricing decision is durable and keyed to the idempotency key, so
+	// the booking half retries bounded times on seat-contention serialization
+	// failures (the accumulator row lock is the money serialization point;
+	// the seat row is retried, never double-charged).
+	var ticket ticketing.Ticket
+	const maxBookingAttempts = 5
+	for attempt := 1; ; attempt++ {
+		ticket, err = service.bookPriced(ctx, request, trip, digest, journey, account)
+		if err == nil {
+			break
+		}
+		if attempt < maxBookingAttempts && isSerializationFailure(err) {
+			continue
+		}
 		// Saga compensation: return the spend so a failed purchase never
 		// consumes cap allowance.
 		if reverseErr := service.fare.ReverseJourney(ctx, journey.JourneyID, service.event(EventCapJourneyReversed, journey.JourneyID, request.CorrelationID, map[string]any{
@@ -191,6 +204,13 @@ func (service *JourneyService) Purchase(ctx context.Context, request JourneyPurc
 // purchase idempotency key, so one key prices exactly once.
 func journeyIDFor(idempotencyKey string) string {
 	return "jny-" + idempotencyKey
+}
+
+// isSerializationFailure reports a PostgreSQL 40001 serialization failure
+// (safe to retry: nothing committed).
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40001"
 }
 
 // bookPriced runs the seat booking saga at the priced charge.

@@ -155,6 +155,13 @@ func (service *SettlementService) SettleBestFare(ctx context.Context, weekStart 
 		if accumulator.ScopeType != ScopeTypeNetwork || accumulator.SpentMinor <= product.PriceNGNMinor {
 			continue
 		}
+		// Exactly-once guard BEFORE any money movement (the deterministic
+		// transfer ID is the cluster-side backstop, not the mechanism).
+		if exists, err := service.store.BestFareAdjustmentExists(ctx, accumulator.SubjectRef, periodStart); err != nil {
+			return settled, err
+		} else if exists {
+			continue
+		}
 		adjustment := accumulator.SpentMinor - product.PriceNGNMinor
 		reference := fmt.Sprintf("bestfare:%s:%s", accumulator.SubjectRef, periodStart.Format("2006-01-02"))
 		transferID, err := service.creditBestFare(ctx, accumulator.SubjectRef, reference, adjustment)
