@@ -60,6 +60,8 @@ func testTopology() Topology {
 		PassengerClearingAccount: tigerbeetle.ToUint128(1001),
 		OperatorRevenueAccount:   tigerbeetle.ToUint128(1002),
 		AgentFloatAccount:        tigerbeetle.ToUint128(1003),
+		MinistrySubsidyAccount:   tigerbeetle.ToUint128(1004),
+		PlatformFeeAccount:       tigerbeetle.ToUint128(1005),
 		PendingTimeoutSeconds:    900,
 	}
 }

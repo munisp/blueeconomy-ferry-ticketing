@@ -298,3 +298,10 @@ func (service *BoardingService) emitFraudEvent(ctx context.Context, eventType, t
 func (service *BoardingService) verifierWindowSecret() string {
 	return service.verifier.WindowSecret()
 }
+
+// ArtifactVerifier exposes the artifact verifier for composed services that
+// verify artifacts outside the online gate path (conductor store-and-forward
+// batches verify authenticity at the scan instant).
+func (service *BoardingService) ArtifactVerifier() *ticketproof.Verifier {
+	return service.verifier
+}

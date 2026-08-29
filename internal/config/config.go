@@ -36,6 +36,8 @@ type Config struct {
 	PassengerClearingAccount      string
 	OperatorRevenueAccount        string
 	AgentFloatAccount             string
+	MinistrySubsidyAccount        string
+	PlatformFeeAccount            string
 	PendingTransferTimeoutSeconds uint32
 
 	// VoidDualControlThresholdNGNMinor is the fare (kobo) at or above which
@@ -54,6 +56,12 @@ type Config struct {
 	TicketPreviousKeyGraceUntil  time.Time
 	TicketRotationEpoch          uint32
 	TicketWindowSecret           string
+
+	// BlueFare: pass validation signing key (env-injected, rotating epochs)
+	// and the rail webhook HMAC secret guarding the only top-up credit path.
+	PassSigningKeyFile    string
+	PassRotationEpoch     uint32
+	TopUpWebhookHMACSecret string
 }
 
 // Load reads and validates the environment, failing closed on any missing or
@@ -125,6 +133,8 @@ func Load() (Config, error) {
 		{"FERRY_TB_PASSENGER_CLEARING_ACCOUNT", &config.PassengerClearingAccount},
 		{"FERRY_TB_OPERATOR_REVENUE_ACCOUNT", &config.OperatorRevenueAccount},
 		{"FERRY_TB_AGENT_FLOAT_ACCOUNT", &config.AgentFloatAccount},
+		{"FERRY_TB_MINISTRY_SUBSIDY_ACCOUNT", &config.MinistrySubsidyAccount},
+		{"FERRY_TB_PLATFORM_FEE_ACCOUNT", &config.PlatformFeeAccount},
 	} {
 		*account.value = strings.TrimSpace(os.Getenv(account.name))
 		if *account.value == "" {
@@ -156,7 +166,35 @@ func Load() (Config, error) {
 	if err := config.loadTicketProof(); err != nil {
 		return Config{}, err
 	}
+	if err := config.loadBlueFare(); err != nil {
+		return Config{}, err
+	}
 	return config, nil
+}
+
+// loadBlueFare validates the BlueFare pass-validation and top-up
+// configuration. The service fails closed without the injected pass signing
+// key and the rail webhook HMAC secret.
+func (config *Config) loadBlueFare() error {
+	config.PassSigningKeyFile = strings.TrimSpace(os.Getenv("FERRY_PASS_SIGNING_KEY_FILE"))
+	if config.PassSigningKeyFile == "" {
+		return errors.New("FERRY_PASS_SIGNING_KEY_FILE is required (fail-closed: no pass validation without an injected key)")
+	}
+	config.TopUpWebhookHMACSecret = strings.TrimSpace(os.Getenv("FERRY_TOPUP_WEBHOOK_HMAC_SECRET"))
+	if len(config.TopUpWebhookHMACSecret) < 16 {
+		return errors.New("FERRY_TOPUP_WEBHOOK_HMAC_SECRET is required and must be at least 16 characters")
+	}
+	epoch := strings.TrimSpace(os.Getenv("FERRY_PASS_ROTATION_EPOCH"))
+	if epoch == "" {
+		config.PassRotationEpoch = 1
+		return nil
+	}
+	parsed, err := parseNonZeroUint32("FERRY_PASS_ROTATION_EPOCH")
+	if err != nil {
+		return err
+	}
+	config.PassRotationEpoch = parsed
+	return nil
 }
 
 // loadTicketProof validates the signed-ticket-artifact configuration. The

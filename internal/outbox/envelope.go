@@ -76,6 +76,7 @@ type Provenance struct {
 var topics = map[string]struct{}{
 	"ferries.ticketing.v1": {},
 	"ferries.manifest.v1":  {},
+	"ferries.fare.v1":      {},
 }
 
 // envelopeEventTypes maps internal outbox event types to envelope event types.

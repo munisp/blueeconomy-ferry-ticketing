@@ -94,6 +94,7 @@ type Server struct {
 	operator  OperatorStore
 	manifests ManifestSource
 	boarding  BoardingService
+	fare      FareRoutes
 	salt      string
 	kpi       float64
 	logger    *slog.Logger

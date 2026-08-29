@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/outbox"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
@@ -60,7 +61,7 @@ func run() error {
 
 	producers := make([]*outbox.KafkaProducer, 0, 2)
 	router := outbox.MapRouter{}
-	for _, topic := range []string{ticketing.TopicTicketing, ticketing.TopicManifest} {
+	for _, topic := range []string{ticketing.TopicTicketing, ticketing.TopicManifest, fare.TopicFare} {
 		producer, err := outbox.NewKafkaProducer(brokers, topic)
 		if err != nil {
 			return err

@@ -23,6 +23,7 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 	ferryworkflow "github.com/munisp/blueeconomy-ferry-ticketing/internal/workflow"
@@ -54,6 +55,19 @@ func requiredUint32(name string) (uint32, error) {
 		return 0, fmt.Errorf("%s must be a non-zero uint32", name)
 	}
 	return uint32(parsed), nil
+}
+
+// optionalInt reads an integer env var with a default.
+func optionalInt(name string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return parsed, nil
 }
 
 // optionalDurationSeconds reads a seconds-valued env var with a default.
@@ -112,6 +126,10 @@ func run(logger *slog.Logger) error {
 	}
 	defer reconciler.close()
 	go reconciler.run(ctx, logger)
+
+	// Nightly pass expiry sweep (ACTIVE -> EXPIRED past valid_to). Cap
+	// accumulator rollover is lazy by design, so this is the only fare sweep.
+	go runPassExpirySweep(ctx, pool, logger)
 
 	temporalClient, err := client.Dial(client.Options{
 		HostPort:  temporalAddress,
@@ -228,6 +246,44 @@ func (reconciler *reconciler) run(ctx context.Context, logger *slog.Logger) {
 				logger.Info("reconciler sweep",
 					"completed", report.Completed, "expired", report.Expired,
 					"pending", report.Pending, "failed", report.Failed)
+			}
+		}
+	}
+}
+
+// runPassExpirySweep expires ACTIVE passes past valid_to on a configurable
+// cadence (default nightly), following the reconciler's loop pattern.
+func runPassExpirySweep(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) {
+	interval, err := optionalDurationSeconds("FERRY_PASS_SWEEP_INTERVAL_SECONDS", 24*time.Hour)
+	if err != nil {
+		logger.Error("pass expiry sweep disabled", "error", err)
+		return
+	}
+	batchSize, err := optionalInt("FERRY_PASS_SWEEP_BATCH", 500)
+	if err != nil {
+		logger.Error("pass expiry sweep disabled", "error", err)
+		return
+	}
+	fareStore, err := fare.NewPostgresStore(pool)
+	if err != nil {
+		logger.Error("pass expiry sweep disabled", "error", err)
+		return
+	}
+	logger.Info("pass expiry sweep armed", "interval", interval, "batch", batchSize)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			swept, err := fare.SweepExpiredPasses(ctx, fareStore, time.Now().UTC(), batchSize)
+			if err != nil {
+				logger.Error("pass expiry sweep failed", "error", err)
+				continue
+			}
+			if swept > 0 {
+				logger.Info("pass expiry sweep completed", "expired", swept)
 			}
 		}
 	}

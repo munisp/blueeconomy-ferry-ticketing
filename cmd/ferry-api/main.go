@@ -21,9 +21,11 @@ import (
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/auth"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/config"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/httpapi"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/manifest"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/passproof"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketproof"
@@ -106,12 +108,22 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("FERRY_TB_AGENT_FLOAT_ACCOUNT: %w", err)
 	}
+	subsidy, err := ledger.ParseID(cfg.MinistrySubsidyAccount)
+	if err != nil {
+		return fmt.Errorf("FERRY_TB_MINISTRY_SUBSIDY_ACCOUNT: %w", err)
+	}
+	platformFee, err := ledger.ParseID(cfg.PlatformFeeAccount)
+	if err != nil {
+		return fmt.Errorf("FERRY_TB_PLATFORM_FEE_ACCOUNT: %w", err)
+	}
 	ledgerService, err := ledger.New(tbClient, ledger.Topology{
 		Ledger:                   cfg.TigerBeetleLedger,
 		Code:                     cfg.TigerBeetleCode,
 		PassengerClearingAccount: clearing,
 		OperatorRevenueAccount:   revenue,
 		AgentFloatAccount:        agentFloat,
+		MinistrySubsidyAccount:   subsidy,
+		PlatformFeeAccount:       platformFee,
 		PendingTimeoutSeconds:    cfg.PendingTransferTimeoutSeconds,
 	})
 	if err != nil {
@@ -143,6 +155,9 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := configureBlueFare(ctx, cfg, pool, ticketStore, boarding, ledgerService, authenticator, server); err != nil {
+		return fmt.Errorf("configure BlueFare: %w", err)
+	}
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddress,
@@ -163,6 +178,78 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}
 	return nil
+}
+
+// configureBlueFare wires the BlueFare account-based fare system: pass
+// products and passes, account-based capping, offline validation with
+// rotating key epochs, the conductor store-and-forward API, top-ups and
+// settlement. It fails closed on any missing dependency.
+func configureBlueFare(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, ticketStore *ticketing.PostgresStore, boarding *ticketing.BoardingService, ledgerService *ledger.Service, authenticator auth.Authenticator, server *httpapi.Server) error {
+	fareStore, err := fare.NewPostgresStore(pool)
+	if err != nil {
+		return err
+	}
+	passKey, err := ticketproof.LoadPrivateKeyFile(cfg.PassSigningKeyFile)
+	if err != nil {
+		return fmt.Errorf("load pass validation signing key: %w", err)
+	}
+	passSigner, err := passproof.NewSigner(passKey, cfg.PassRotationEpoch)
+	if err != nil {
+		return fmt.Errorf("configure pass validation signer: %w", err)
+	}
+	validation, err := fare.NewValidationService(fareStore, passSigner)
+	if err != nil {
+		return err
+	}
+	// Provision the rotating key directory so devices can sync it.
+	if err := validation.ProvisionKeyDirectory(ctx); err != nil {
+		return fmt.Errorf("provision pass validation key directory: %w", err)
+	}
+	passService, err := fare.NewPassService(fareStore, ledgerService, ledgerService, cfg.ManifestSalt)
+	if err != nil {
+		return err
+	}
+	journeyService, err := fare.NewJourneyService(ticketStore, fareStore, ledgerService, ledgerService, cfg.ManifestSalt)
+	if err != nil {
+		return err
+	}
+	accountService, err := fare.NewAccountService(fareStore, ledgerService, cfg.ManifestSalt, cfg.TopUpWebhookHMACSecret)
+	if err != nil {
+		return err
+	}
+	// Conductor batches verify ticket artifacts for authenticity at the scan
+	// instant (the rotating window code is an online-gate-only check).
+	boardingVerifier, err := ticketproofVerifier(boarding)
+	if err != nil {
+		return err
+	}
+	conductorService, err := fare.NewConductorService(fareStore, ticketStore, boardingVerifier, validation, ledgerService)
+	if err != nil {
+		return err
+	}
+	settlementService, err := fare.NewSettlementService(fareStore, ledgerService, ledgerService)
+	if err != nil {
+		return err
+	}
+	return server.RegisterFareRoutes(authenticator, httpapi.FareRoutes{
+		Passes:     passService,
+		Journeys:   journeyService,
+		Validation: validation,
+		Conductor:  conductorService,
+		Accounts:   accountService,
+		Settlement: settlementService,
+		Store:      fareStore,
+	})
+}
+
+// ticketproofVerifier exposes the boarding service's artifact verifier for
+// conductor batch authenticity checks.
+func ticketproofVerifier(boarding *ticketing.BoardingService) (*ticketproof.Verifier, error) {
+	verifier := boarding.ArtifactVerifier()
+	if verifier == nil {
+		return nil, errors.New("boarding artifact verifier is unavailable (fail-closed)")
+	}
+	return verifier, nil
 }
 
 // configureBoarding loads the env-injected Ed25519 signing key files and

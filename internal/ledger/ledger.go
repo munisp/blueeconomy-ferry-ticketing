@@ -29,7 +29,12 @@ type Topology struct {
 	PassengerClearingAccount tigerbeetle.Uint128
 	OperatorRevenueAccount   tigerbeetle.Uint128
 	AgentFloatAccount        tigerbeetle.Uint128
-	PendingTimeoutSeconds    uint32
+	// MinistrySubsidyAccount funds encoded subsidy (concessions, ministry
+	// top-ups); PlatformFeeAccount receives the platform share of operator
+	// settlements. Both are operator configuration, never defaulted.
+	MinistrySubsidyAccount tigerbeetle.Uint128
+	PlatformFeeAccount     tigerbeetle.Uint128
+	PendingTimeoutSeconds  uint32
 }
 
 // Validate fails closed on any gap in the topology.
@@ -41,10 +46,19 @@ func (topology Topology) Validate() error {
 	if topology.PassengerClearingAccount == zero || topology.OperatorRevenueAccount == zero || topology.AgentFloatAccount == zero {
 		return errors.New("clearing, revenue and agent float accounts must be non-zero")
 	}
-	if topology.PassengerClearingAccount == topology.OperatorRevenueAccount ||
-		topology.PassengerClearingAccount == topology.AgentFloatAccount ||
-		topology.OperatorRevenueAccount == topology.AgentFloatAccount {
-		return errors.New("ledger accounts must be distinct")
+	if topology.MinistrySubsidyAccount == zero || topology.PlatformFeeAccount == zero {
+		return errors.New("ministry subsidy and platform fee accounts must be non-zero")
+	}
+	accounts := []tigerbeetle.Uint128{
+		topology.PassengerClearingAccount, topology.OperatorRevenueAccount,
+		topology.AgentFloatAccount, topology.MinistrySubsidyAccount, topology.PlatformFeeAccount,
+	}
+	for i, left := range accounts {
+		for _, right := range accounts[i+1:] {
+			if left == right {
+				return errors.New("ledger accounts must be distinct")
+			}
+		}
 	}
 	return nil
 }
@@ -72,6 +86,8 @@ func (service *Service) EnsureAccounts() error {
 		service.topology.PassengerClearingAccount,
 		service.topology.OperatorRevenueAccount,
 		service.topology.AgentFloatAccount,
+		service.topology.MinistrySubsidyAccount,
+		service.topology.PlatformFeeAccount,
 	} {
 		results, err := service.client.CreateAccounts([]tigerbeetle.Account{{
 			ID:     id,
