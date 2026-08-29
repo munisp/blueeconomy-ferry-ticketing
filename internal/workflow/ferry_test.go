@@ -35,9 +35,18 @@ func (suite *ferrySuite) TearDownTest() {
 }
 
 func (suite *ferrySuite) register(paused *bool, alerts *[]AdverseWeatherSignal, incomplete *bool) {
+	var departed bool
+	suite.registerWithDeparture(paused, &departed, alerts, incomplete)
+}
+
+func (suite *ferrySuite) registerWithDeparture(paused, departed *bool, alerts *[]AdverseWeatherSignal, incomplete *bool) {
 	activities := &Activities{
 		PauseBoarding: func(_ context.Context, tripID string) error {
 			*paused = true
+			return nil
+		},
+		MarkTripDeparted: func(_ context.Context, tripID string) error {
+			*departed = true
 			return nil
 		},
 		EmitWeatherAlert: func(_ context.Context, tripID, routeReference string, alert AdverseWeatherSignal, correlationID string) error {
@@ -53,6 +62,7 @@ func (suite *ferrySuite) register(paused *bool, alerts *[]AdverseWeatherSignal, 
 	require.NoError(suite.T(), err)
 	suite.env.RegisterWorkflowWithOptions(definition.FerryTicketWorkflow, sdkworkflow.RegisterOptions{Name: "FerryTicketWorkflow"})
 	suite.env.RegisterActivityWithOptions(activities.PauseBoarding, activityRegisterOptions(ActivityPauseBoarding))
+	suite.env.RegisterActivityWithOptions(activities.MarkTripDeparted, activityRegisterOptions(ActivityMarkTripDeparted))
 	suite.env.RegisterActivityWithOptions(activities.EmitWeatherAlert, activityRegisterOptions(ActivityEmitWeatherAlert))
 	suite.env.RegisterActivityWithOptions(activities.RecordManifestIncomplete, activityRegisterOptions(ActivityRecordManifestIncomplete))
 }
@@ -202,6 +212,36 @@ func (suite *ferrySuite) TestInputValidationFailsClosed() {
 	suite.env.ExecuteWorkflow("FerryTicketWorkflow", Input{})
 	require.True(suite.T(), suite.env.IsWorkflowCompleted())
 	require.Error(suite.T(), suite.env.GetWorkflowError())
+}
+
+// TestDeparturePersistsTripStatus is the FE-6 regression: at the departure
+// instant the workflow records the DEPARTED lifecycle state via the activity
+// — the historical record never claims SCHEDULED forever — including when
+// the manifest is missing.
+func (suite *ferrySuite) TestDeparturePersistsTripStatus() {
+	var paused, departed, incomplete bool
+	var alerts []AdverseWeatherSignal
+	suite.registerWithDeparture(&paused, &departed, &alerts, &incomplete)
+	departure := time.Now().Add(2 * time.Hour)
+	suite.env.RegisterDelayedCallback(func() {
+		suite.env.SignalWorkflow(SignalManifestSubmitted, ManifestSignal{ManifestID: "m-1", ManifestDigestSHA256: "digest", PassengerCount: 5})
+		suite.env.SignalWorkflow(SignalTelemetryUpdated, TelemetrySignal{TelemetryReference: "tel-1", PayloadDigestSHA256: "digest", ObservedAt: time.Now()})
+	}, time.Hour)
+	suite.env.ExecuteWorkflow("FerryTicketWorkflow", workflowInput(departure))
+	require.True(suite.T(), suite.env.IsWorkflowCompleted())
+	require.NoError(suite.T(), suite.env.GetWorkflowError())
+	require.True(suite.T(), departed, "the departure activity persists the DEPARTED status")
+}
+
+func (suite *ferrySuite) TestDepartureWithoutManifestStillMarksDeparted() {
+	var paused, departed, incomplete bool
+	var alerts []AdverseWeatherSignal
+	suite.registerWithDeparture(&paused, &departed, &alerts, &incomplete)
+	suite.env.ExecuteWorkflow("FerryTicketWorkflow", workflowInput(time.Now().Add(2*time.Hour)))
+	require.True(suite.T(), suite.env.IsWorkflowCompleted())
+	require.Error(suite.T(), suite.env.GetWorkflowError(), "missing manifest still fails closed")
+	require.True(suite.T(), departed, "the trip departed physically; the status is persisted even without a manifest")
+	require.True(suite.T(), incomplete)
 }
 
 func (suite *ferrySuite) TestNewFerryWorkflowFailsClosedWithoutActivities() {

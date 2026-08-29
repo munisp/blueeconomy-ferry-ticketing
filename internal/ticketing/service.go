@@ -40,13 +40,15 @@ const (
 
 // Outbox event types produced by this service.
 const (
-	EventTicketReserved   = "ferry.ticket.reserved"
-	EventTicketPaid       = "ferry.ticket.paid"
-	EventTicketIssued     = "ferry.ticket.issued"
-	EventTicketRefunded   = "ferry.ticket.refunded"
-	EventTicketExpired    = "ferry.ticket.expired"
-	EventTicketVoided     = "ferry.ticket.voided"
-	EventAgentCashIn      = "ferry.agent.cash_in_recorded"
+	EventTicketReserved = "ferry.ticket.reserved"
+	EventTicketPaid     = "ferry.ticket.paid"
+	EventTicketIssued   = "ferry.ticket.issued"
+	EventTicketRefunded = "ferry.ticket.refunded"
+	EventTicketExpired  = "ferry.ticket.expired"
+	EventTicketVoided   = "ferry.ticket.voided"
+	EventAgentCashIn    = "ferry.agent.cash_in_recorded"
+	// EventTripCancelled audits the operator-initiated trip cancellation.
+	EventTripCancelled = "ferry.trip.cancelled"
 	// EventVoidApprovalRequested audits the maker half of a dual-control
 	// void: the first officer's request a second officer must confirm.
 	EventVoidApprovalRequested = "ferry.ticket.void_approval_requested"

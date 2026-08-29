@@ -235,11 +235,11 @@ func (store *fakeStore) ListUnissuedPaidBefore(_ context.Context, cutoff time.Ti
 // posted beats voided, an auto-voided (timed-out) pending reserve resolves as
 // released.
 type fakeLedger struct {
-	mu         sync.Mutex
-	reserved   []string
-	posted     []string
-	voided     []string
-	refunded   []string
+	mu              sync.Mutex
+	reserved        []string
+	posted          []string
+	voided          []string
+	refunded        []string
 	reserveErr      error
 	postErr         error
 	resolveErr      error
@@ -585,7 +585,7 @@ func TestReconcileIssuesInterruptedPaidTicket(t *testing.T) {
 		TicketID: "ticket-paid", TripID: "trip-1", OperatorID: "op-1",
 		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
 		State: StatePaid, Version: 2, LedgerReserveID: "reserve-ticket-paid",
-		LedgerPostID: "post-reserve-ticket-paid",
+		LedgerPostID:       "post-reserve-ticket-paid",
 		PurchaserPrincipal: "subject-1", CorrelationID: "corr-paid",
 	}
 	report, err := service.Reconcile(context.Background(), 0, 0, 10)
@@ -667,7 +667,7 @@ func seedSoldTicket(store *fakeStore, ticketID string) Ticket {
 		TicketID: ticketID, TripID: "trip-1", OperatorID: "op-1",
 		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
 		State: StatePaid, Version: 2, LedgerReserveID: "reserve-" + ticketID,
-		LedgerPostID: "post-reserve-" + ticketID,
+		LedgerPostID:       "post-reserve-" + ticketID,
 		PurchaserPrincipal: "subject-1", CorrelationID: "corr-" + ticketID,
 	}
 	store.tickets[ticketID] = ticket

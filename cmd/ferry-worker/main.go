@@ -127,6 +127,9 @@ func run(logger *slog.Logger) error {
 		PauseBoarding: func(ctx context.Context, tripID string) error {
 			return store.MarkTripBoardingPaused(ctx, tripID)
 		},
+		MarkTripDeparted: func(ctx context.Context, tripID string) error {
+			return store.MarkTripDeparted(ctx, tripID)
+		},
 		EmitWeatherAlert: func(ctx context.Context, tripID, routeReference string, alert ferryworkflow.AdverseWeatherSignal, correlationID string) error {
 			return store.AppendEvent(ctx, ticketing.Event{
 				EventID:       uuid.NewString(),
@@ -167,6 +170,7 @@ func run(logger *slog.Logger) error {
 	temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflowWithOptions(definition.FerryTicketWorkflow, sdkworkflow.RegisterOptions{Name: "FerryTicketWorkflow"})
 	temporalWorker.RegisterActivityWithOptions(activities.PauseBoarding, activity.RegisterOptions{Name: ferryworkflow.ActivityPauseBoarding})
+	temporalWorker.RegisterActivityWithOptions(activities.MarkTripDeparted, activity.RegisterOptions{Name: ferryworkflow.ActivityMarkTripDeparted})
 	temporalWorker.RegisterActivityWithOptions(activities.EmitWeatherAlert, activity.RegisterOptions{Name: ferryworkflow.ActivityEmitWeatherAlert})
 	temporalWorker.RegisterActivityWithOptions(activities.RecordManifestIncomplete, activity.RegisterOptions{Name: ferryworkflow.ActivityRecordManifestIncomplete})
 

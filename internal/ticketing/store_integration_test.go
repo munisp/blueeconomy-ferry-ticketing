@@ -286,8 +286,8 @@ func TestSeatReleaseOnTerminalTransitionIntegration(t *testing.T) {
 		_, err := store.ReserveSeat(ctx, Ticket{
 			TicketID: ticketID, TripID: "trip-int", OperatorID: "op-int",
 			PassengerDigest: "sha256:" + ticketID + ticketID + ticketID + ticketID,
-			FareNGNMinor: 250000, Channel: ChannelDirect, State: StateReserved,
-			LedgerReserveID: "tb-reserve-" + ticketID,
+			FareNGNMinor:    250000, Channel: ChannelDirect, State: StateReserved,
+			LedgerReserveID:    "tb-reserve-" + ticketID,
 			PurchaserPrincipal: "kc-integration-buyer", CorrelationID: "corr-" + ticketID,
 		}, key, Event{
 			EventID: "evt-" + ticketID, Topic: TopicTicketing, SubjectID: ticketID,
@@ -471,6 +471,91 @@ func TestVoidApprovalDualControlIntegration(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Fatalf("void approval audit events = %d, expected 1", eventCount)
+	}
+}
+
+// TestTripStatusLifecycleIntegration proves the FE-6 persistence contract:
+// trips leave SCHEDULED in the database — departure via the workflow
+// activity path (idempotent, never from CANCELLED), cancellation via the
+// operator path (scoped, open trips only, audited).
+func TestTripStatusLifecycleIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool := openIntegrationPool(t, ctx)
+	defer pool.Close()
+
+	seedTrip(t, ctx, pool, "op-int", "vessel-int", "trip-int", 2)
+	store, err := NewPostgresStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(tripID string) string {
+		t.Helper()
+		trip, err := store.GetTrip(ctx, tripID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return trip.Status
+	}
+	cancelEvent := func(eventID, tripID string) Event {
+		return Event{
+			EventID: eventID, Topic: TopicTicketing, SubjectID: tripID,
+			EventType: EventTripCancelled, CorrelationID: "corr-" + tripID,
+			Payload: map[string]any{"trip_id": tripID},
+		}
+	}
+
+	// Departure persists DEPARTED and is idempotent (activity retries).
+	if err := store.MarkTripDeparted(ctx, "trip-int"); err != nil {
+		t.Fatalf("mark departed: %v", err)
+	}
+	if got := status("trip-int"); got != "DEPARTED" {
+		t.Fatalf("status = %s, expected DEPARTED", got)
+	}
+	if err := store.MarkTripDeparted(ctx, "trip-int"); err != nil {
+		t.Fatalf("departure must be idempotent: %v", err)
+	}
+	if err := store.MarkTripDeparted(ctx, "trip-missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown trip departure err = %v, expected ErrNotFound", err)
+	}
+	// A departed trip cannot be cancelled.
+	if err := store.CancelTrip(ctx, "op-int", "trip-int", cancelEvent("evt-tc-0", "trip-int")); err == nil {
+		t.Fatal("departed trip must not be cancellable")
+	}
+
+	// Cancellation persists CANCELLED with its audit event, operator-scoped.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO trips (trip_id, vessel_id, operator_id, route_reference, terminal_reference, scheduled_departure, fare_ngn_minor, capacity)
+		 VALUES ('trip-int-2', 'vessel-int', 'op-int', 'route-int', 'terminal-int', $1, 250000, 2)`,
+		time.Now().Add(24*time.Hour).UTC()); err != nil {
+		t.Fatalf("insert second trip: %v", err)
+	}
+	if err := store.CancelTrip(ctx, "op-other", "trip-int-2", cancelEvent("evt-tc-x", "trip-int-2")); err == nil {
+		t.Fatal("cross-operator cancellation must match no row")
+	}
+	if got := status("trip-int-2"); got != "SCHEDULED" {
+		t.Fatalf("status after cross-operator attempt = %s, expected SCHEDULED", got)
+	}
+	if err := store.CancelTrip(ctx, "op-int", "trip-int-2", cancelEvent("evt-tc-1", "trip-int-2")); err != nil {
+		t.Fatalf("cancel trip: %v", err)
+	}
+	if got := status("trip-int-2"); got != "CANCELLED" {
+		t.Fatalf("status = %s, expected CANCELLED", got)
+	}
+	if err := store.CancelTrip(ctx, "op-int", "trip-int-2", cancelEvent("evt-tc-2", "trip-int-2")); err == nil {
+		t.Fatal("second cancellation must fail")
+	}
+	// A cancelled trip never departs.
+	if err := store.MarkTripDeparted(ctx, "trip-int-2"); err == nil {
+		t.Fatal("cancelled trip must not depart")
+	}
+	var eventCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ferry_outbox WHERE event_type = $1 AND subject_id = 'trip-int-2'`,
+		EventTripCancelled).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("trip cancelled audit events = %d, expected 1", eventCount)
 	}
 }
 

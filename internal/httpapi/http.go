@@ -71,6 +71,9 @@ type OperatorStore interface {
 	DeleteVessel(ctx context.Context, operatorID, vesselID string) error
 	CreateTrip(ctx context.Context, trip ticketing.Trip) error
 	ListTrips(ctx context.Context, operatorID string) ([]ticketing.Trip, error)
+	// CancelTrip persists the operator-initiated CANCELLED trip status with
+	// its audit event in one transaction.
+	CancelTrip(ctx context.Context, operatorID, tripID string, event ticketing.Event) error
 	GetTripScoped(ctx context.Context, operatorID, tripID string) (ticketing.Trip, error)
 	GetTrip(ctx context.Context, tripID string) (ticketing.Trip, error)
 	GetTicket(ctx context.Context, ticketID string) (ticketing.Ticket, error)
@@ -164,6 +167,7 @@ func (server *Server) routes(authenticator auth.Authenticator) {
 	server.mux.Handle("DELETE /v1/operator/vessels/{id}", protected(http.HandlerFunc(server.deleteVessel), RoleOperator))
 	server.mux.Handle("POST /v1/operator/trips", protected(http.HandlerFunc(server.createTrip), RoleOperator))
 	server.mux.Handle("GET /v1/operator/trips", protected(http.HandlerFunc(server.listTrips), RoleOperator))
+	server.mux.Handle("POST /v1/operator/trips/{id}/cancel", protected(http.HandlerFunc(server.cancelTrip), RoleOperator))
 	server.mux.Handle("POST /v1/operator/trips/{id}/manifest/export", protected(http.HandlerFunc(server.exportManifest), RoleOperator))
 	server.mux.Handle("POST /v1/operator/tickets/{id}/embark", protected(http.HandlerFunc(server.embarkTicket), RoleOperator))
 	server.mux.Handle("GET /v1/operator/dashboard", protected(http.HandlerFunc(server.dashboard), RoleOperator))

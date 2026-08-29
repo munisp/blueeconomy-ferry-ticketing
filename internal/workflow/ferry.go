@@ -27,6 +27,10 @@ const (
 
 	// ActivityPauseBoarding flips the trip to BOARDING_PAUSED.
 	ActivityPauseBoarding = "ferry.pause-boarding"
+	// ActivityMarkTripDeparted persists the DEPARTED trip lifecycle state at
+	// the departure instant (the DB row is the historical record; the
+	// workflow phase is in-memory only).
+	ActivityMarkTripDeparted = "ferry.mark-trip-departed"
 	// ActivityEmitWeatherAlert writes the AdverseWeatherAlert outbox event
 	// bound for the NIMASA topic (ferries.manifest.v1).
 	ActivityEmitWeatherAlert = "ferry.emit-adverse-weather-alert"
@@ -119,6 +123,9 @@ type Result struct {
 type Activities struct {
 	// PauseBoarding flips the trip to BOARDING_PAUSED.
 	PauseBoarding func(ctx context.Context, tripID string) error
+	// MarkTripDeparted persists the DEPARTED trip status at the departure
+	// instant (idempotent: activities retry).
+	MarkTripDeparted func(ctx context.Context, tripID string) error
 	// EmitWeatherAlert records the AdverseWeatherAlert outbox event for the
 	// NIMASA topic.
 	EmitWeatherAlert func(ctx context.Context, tripID, routeReference string, alert AdverseWeatherSignal, correlationID string) error
@@ -133,7 +140,7 @@ type FerryWorkflow struct{ activities *Activities }
 
 // NewFerryWorkflow fails closed when activities are absent.
 func NewFerryWorkflow(activities *Activities) (*FerryWorkflow, error) {
-	if activities == nil || activities.PauseBoarding == nil || activities.EmitWeatherAlert == nil || activities.RecordManifestIncomplete == nil {
+	if activities == nil || activities.PauseBoarding == nil || activities.MarkTripDeparted == nil || activities.EmitWeatherAlert == nil || activities.RecordManifestIncomplete == nil {
 		return nil, errors.New("ferry workflow activities are required")
 	}
 	return &FerryWorkflow{activities: activities}, nil
@@ -215,6 +222,14 @@ func (definition *FerryWorkflow) FerryTicketWorkflow(ctx workflow.Context, input
 	// boarding pauses inside the 30-minute window.
 	for !departed {
 		selector.Select(ctx)
+	}
+
+	// The departure instant is reached: persist the DEPARTED lifecycle
+	// state before any terminal evaluation so historical trips never claim
+	// SCHEDULED forever. The activity is idempotent; a failure retries via
+	// the workflow error path.
+	if err := workflow.ExecuteActivity(actx, ActivityMarkTripDeparted, input.TripID).Get(actx, nil); err != nil {
+		return Result{}, fmt.Errorf("mark trip %s departed: %w", input.TripID, err)
 	}
 
 	if !status.ManifestReceived {

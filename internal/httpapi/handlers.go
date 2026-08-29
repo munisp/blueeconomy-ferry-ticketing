@@ -308,6 +308,41 @@ func (server *Server) listTrips(writer http.ResponseWriter, request *http.Reques
 	writeJSON(writer, http.StatusOK, map[string]any{"trips": trips})
 }
 
+// cancelTrip persists the operator-initiated CANCELLED trip status. Only a
+// trip still open (SCHEDULED or BOARDING_PAUSED) can be cancelled; the
+// operator scope is enforced in the UPDATE (cross-tenant cancels match no
+// row). Ticket refunds for the cancelled trip are a separate, explicit flow.
+func (server *Server) cancelTrip(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	operatorID, ok := operatorScope(writer, request)
+	if !ok {
+		return
+	}
+	tripID := request.PathValue("id")
+	correlation := correlationID(request)
+	if err := server.operator.CancelTrip(request.Context(), operatorID, tripID, ticketing.Event{
+		EventID:       uuid.NewString(),
+		Topic:         ticketing.TopicTicketing,
+		SubjectID:     tripID,
+		EventType:     ticketing.EventTripCancelled,
+		CorrelationID: correlation,
+		Payload: map[string]any{
+			"trip_id":        tripID,
+			"operator_id":    operatorID,
+			"principal_id":   resolved.Subject,
+			"principal_role": RoleOperator,
+		},
+	}); err != nil {
+		server.logger.Warn("trip cancellation rejected", "trip_id", tripID, "error", err.Error())
+		writeDomainError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]string{"tripId": tripID, "status": "CANCELLED"})
+}
+
 func (server *Server) embarkTicket(writer http.ResponseWriter, request *http.Request) {
 	operatorID, ok := operatorScope(writer, request)
 	if !ok {

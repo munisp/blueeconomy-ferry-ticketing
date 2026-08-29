@@ -246,3 +246,60 @@ func (store *PostgresStore) MarkTripBoardingPaused(ctx context.Context, tripID s
 	}
 	return nil
 }
+
+// MarkTripDeparted persists the DEPARTED lifecycle state when the departure
+// time is reached (invoked by the FerryTicketWorkflow departure activity).
+// It is idempotent — Temporal activities retry — and fails closed on an
+// unknown trip or a cancelled one (a cancelled trip never departs).
+func (store *PostgresStore) MarkTripDeparted(ctx context.Context, tripID string) error {
+	result, err := store.pool.Exec(ctx,
+		`UPDATE trips SET status = 'DEPARTED' WHERE trip_id = $1 AND status IN ('SCHEDULED', 'BOARDING_PAUSED')`, tripID)
+	if err != nil {
+		return fmt.Errorf("mark trip departed: %w", err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+	var status string
+	if err := store.pool.QueryRow(ctx, `SELECT status FROM trips WHERE trip_id = $1`, tripID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("load trip for departure: %w", err)
+	}
+	if status == "DEPARTED" {
+		return nil // activity retry: already recorded
+	}
+	return fmt.Errorf("trip %s in status %s cannot depart", tripID, status)
+}
+
+// CancelTrip persists the operator-initiated CANCELLED lifecycle state with
+// its audit event in one transaction. Only a trip still open (SCHEDULED or
+// BOARDING_PAUSED) can be cancelled; the operator scope is enforced in the
+// UPDATE so a cross-tenant cancel matches no row (no existence leak).
+func (store *PostgresStore) CancelTrip(ctx context.Context, operatorID, tripID string, event Event) error {
+	if operatorID == "" || tripID == "" {
+		return errors.New("operator id and trip id are required")
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin cancel transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx,
+		`UPDATE trips SET status = 'CANCELLED' WHERE trip_id = $1 AND operator_id = $2 AND status IN ('SCHEDULED', 'BOARDING_PAUSED')`,
+		tripID, operatorID)
+	if err != nil {
+		return fmt.Errorf("cancel trip: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("trip %s is not open for cancellation", tripID)
+	}
+	if err := insertEventTx(ctx, tx, event); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit cancel: %w", err)
+	}
+	return nil
+}

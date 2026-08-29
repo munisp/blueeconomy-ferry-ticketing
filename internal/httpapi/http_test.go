@@ -117,6 +117,16 @@ func (store *fakeOperatorStore) DeleteVessel(_ context.Context, operatorID, vess
 	return nil
 }
 func (store *fakeOperatorStore) CreateTrip(_ context.Context, trip ticketing.Trip) error { return nil }
+func (store *fakeOperatorStore) CancelTrip(_ context.Context, operatorID, tripID string, event ticketing.Event) error {
+	if store.trip.TripID != tripID || store.trip.OperatorID != operatorID {
+		return ticketing.ErrNotFound
+	}
+	if store.trip.Status != "SCHEDULED" && store.trip.Status != "BOARDING_PAUSED" {
+		return errors.New("trip is not open for cancellation")
+	}
+	store.trip.Status = "CANCELLED"
+	return nil
+}
 func (store *fakeOperatorStore) ListTrips(_ context.Context, operatorID string) ([]ticketing.Trip, error) {
 	return nil, nil
 }
@@ -358,6 +368,30 @@ func TestVoidAboveThresholdConflict(t *testing.T) {
 	server.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Equal(t, "officer-1", tickets.voidPrincipal, "actor identity comes from verified claims")
+}
+
+// TestCancelTripLifecycle is the FE-6 edge regression: the owning operator
+// persists CANCELLED via the endpoint; a passenger role never reaches it and
+// a second cancellation conflicts.
+func TestCancelTripLifecycle(t *testing.T) {
+	server, _, operator, _, _ := newTestServer(t)
+	officer := auth.Principal{Subject: "officer-1", Roles: map[string]struct{}{RoleOperator: {}}, OperatorID: "op-1"}
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, withAuth(httptest.NewRequest(http.MethodPost, "/v1/operator/trips/trip-1/cancel", nil), officer))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, "CANCELLED", operator.trip.Status)
+
+	// Second cancellation conflicts (already terminal).
+	recorder = httptest.NewRecorder()
+	server.ServeHTTP(recorder, withAuth(httptest.NewRequest(http.MethodPost, "/v1/operator/trips/trip-1/cancel", nil), officer))
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+
+	// Passengers have no route to cancellation.
+	server2, _, _, _, _ := newTestServer(t)
+	recorder = httptest.NewRecorder()
+	server2.ServeHTTP(recorder, withAuth(httptest.NewRequest(http.MethodPost, "/v1/operator/trips/trip-1/cancel", nil), passengerPrincipal()))
+	require.Equal(t, http.StatusForbidden, recorder.Code)
 }
 
 func TestPurchaseHappyPath(t *testing.T) {
