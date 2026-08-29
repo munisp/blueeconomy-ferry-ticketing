@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	tigerbeetle "github.com/tigerbeetle/tigerbeetle-go"
 
@@ -34,11 +35,22 @@ func openPool(t *testing.T) *pgxpool.Pool {
 		t.Fatal("FERRY_TEST_DATABASE_URL is required for integration tests")
 	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatalf("parse database url: %v", err)
+	}
+	// The fare suite runs in its own schema so it can execute in parallel
+	// with the ticketing/outbox integration packages, which reset the public
+	// schema of the same shared test database.
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `SET search_path TO faretest, public`)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS faretest CASCADE; CREATE SCHEMA faretest`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
 	migrationsDir := filepath.Join("..", "..", "db", "migrations")
