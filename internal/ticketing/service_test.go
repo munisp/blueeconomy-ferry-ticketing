@@ -84,6 +84,15 @@ func (store *fakeStore) transition(ticketID string, version int64, to State) (Ti
 	if !ValidTransition(ticket.State, to) {
 		return Ticket{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, ticket.State, to)
 	}
+	if to.Terminal() {
+		// Mirrors the PostgreSQL contract: a terminal transition releases the
+		// seat atomically; the state graph makes double-decrement impossible.
+		trip := store.trips[ticket.TripID]
+		if trip.SeatsReserved > 0 {
+			trip.SeatsReserved--
+			store.trips[ticket.TripID] = trip
+		}
+	}
 	ticket.State = to
 	ticket.Version = version + 1
 	store.tickets[ticketID] = ticket
@@ -320,4 +329,54 @@ func TestVoidReleasesPendingReserve(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StateVoid, voided.State)
 	require.Contains(t, ledger.voided, "reserve-ticket-r")
+}
+
+// TestTerminalTransitionsReleaseSeat is the FE-4 regression: refund and void
+// hand the seat back to the trip in the same transition, the release is
+// idempotent (a terminal ticket cannot transition again), and availability is
+// restored for new buyers.
+func TestTerminalTransitionsReleaseSeat(t *testing.T) {
+	service, store, _ := seededService(t)
+	// Fill the trip (capacity 2).
+	first, err := service.Purchase(context.Background(), purchaseRequest("key-1"))
+	require.NoError(t, err)
+	_, err = service.Purchase(context.Background(), purchaseRequest("key-2"))
+	require.NoError(t, err)
+	_, err = service.Purchase(context.Background(), purchaseRequest("key-3"))
+	require.ErrorIs(t, err, ErrCapacityExceeded)
+	require.Equal(t, 2, store.trips["trip-1"].SeatsReserved)
+
+	// Refund restores availability exactly once.
+	_, err = service.Refund(context.Background(), first.TicketID, "subject-1", "passenger", "corr-r1")
+	require.NoError(t, err)
+	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "refund releases the seat")
+	_, err = service.Refund(context.Background(), first.TicketID, "subject-1", "passenger", "corr-r2")
+	require.ErrorIs(t, err, ErrInvalidTransition)
+	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "no double release on the rejected retry")
+
+	// Void restores availability too: a second RESERVED ticket fills the trip.
+	reserved := Ticket{
+		TicketID: "ticket-v", TripID: "trip-1", OperatorID: "op-1", State: StateReserved,
+		Version: 1, LedgerReserveID: "reserve-ticket-v", FareNGNMinor: 250000,
+		PurchaserPrincipal: "subject-1", Channel: ChannelDirect, PassengerDigest: "digest",
+	}
+	trip := store.trips["trip-1"]
+	trip.SeatsReserved++
+	store.trips["trip-1"] = trip
+	store.tickets[reserved.TicketID] = reserved
+	require.Equal(t, 2, store.trips["trip-1"].SeatsReserved, "trip full again")
+	_, err = service.Purchase(context.Background(), purchaseRequest("key-4"))
+	require.ErrorIs(t, err, ErrCapacityExceeded)
+	_, err = service.Void(context.Background(), reserved.TicketID, "corr-void")
+	require.NoError(t, err)
+	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "void releases the seat")
+	_, err = service.Void(context.Background(), reserved.TicketID, "corr-void-2")
+	require.ErrorIs(t, err, ErrInvalidTransition, "void of a terminal ticket fails closed")
+	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "no double release")
+
+	// The freed seats are purchasable again.
+	second, err := service.Purchase(context.Background(), purchaseRequest("key-4"))
+	require.NoError(t, err)
+	require.Equal(t, StateIssued, second.State)
+	require.Equal(t, 2, store.trips["trip-1"].SeatsReserved)
 }

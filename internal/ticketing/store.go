@@ -258,6 +258,22 @@ func transitionTx(ctx context.Context, tx pgx.Tx, ticketID string, version int64
 	if result.RowsAffected() != 1 {
 		return Ticket{}, fmt.Errorf("ticket version conflict on update for %s", ticketID)
 	}
+	if to.Terminal() {
+		// A terminal transition (REFUNDED/EXPIRED/VOID) always releases the
+		// seat in the same transaction. Double-decrement is impossible by
+		// construction: terminal states have no outgoing transitions, so this
+		// branch runs exactly once per ticket, and the seats_reserved guard
+		// plus the CHECK constraint backstop any anomaly.
+		release, err := tx.Exec(ctx,
+			`UPDATE trips SET seats_reserved = seats_reserved - 1
+			 WHERE trip_id = $1 AND seats_reserved > 0`, ticket.TripID)
+		if err != nil {
+			return Ticket{}, fmt.Errorf("release reserved seat: %w", err)
+		}
+		if release.RowsAffected() != 1 {
+			return Ticket{}, fmt.Errorf("release reserved seat: trip %s has no reserved seats to release", ticket.TripID)
+		}
+	}
 	ticket.State = to
 	ticket.Version = version + 1
 	return ticket, nil

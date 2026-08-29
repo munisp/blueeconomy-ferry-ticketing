@@ -249,6 +249,98 @@ func TestConsumeBoardingFirstScanWinsIntegration(t *testing.T) {
 	}
 }
 
+// TestSeatReleaseOnTerminalTransitionIntegration proves the FE-4 contract
+// against PostgreSQL: a terminal transition decrements seats_reserved in the
+// same transaction, the release is exactly-once (the state graph and the
+// optimistic-concurrency guard make a second transition fail), and the freed
+// seat is purchasable again.
+func TestSeatReleaseOnTerminalTransitionIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool := openIntegrationPool(t, ctx)
+	defer pool.Close()
+
+	seedTrip(t, ctx, pool, "op-int", "vessel-int", "trip-int", 1)
+	store, err := NewPostgresStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(ticketID, key string) error {
+		t.Helper()
+		_, err := store.ReserveSeat(ctx, Ticket{
+			TicketID: ticketID, TripID: "trip-int", OperatorID: "op-int",
+			PassengerDigest: "sha256:" + ticketID + ticketID + ticketID + ticketID,
+			FareNGNMinor: 250000, Channel: ChannelDirect, State: StateReserved,
+			LedgerReserveID: "tb-reserve-" + ticketID,
+			PurchaserPrincipal: "kc-integration-buyer", CorrelationID: "corr-" + ticketID,
+		}, key, Event{
+			EventID: "evt-" + ticketID, Topic: TopicTicketing, SubjectID: ticketID,
+			EventType: EventTicketReserved, CorrelationID: "corr-" + ticketID,
+			Payload: map[string]any{"ticket_id": ticketID},
+		})
+		return err
+	}
+	seats := func() int {
+		t.Helper()
+		trip, err := store.GetTrip(ctx, "trip-int")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return trip.SeatsReserved
+	}
+	voidEvent := func(ticketID, eventID string) Event {
+		return Event{
+			EventID: eventID, Topic: TopicTicketing, SubjectID: ticketID,
+			EventType: EventTicketVoided, CorrelationID: "corr-" + ticketID,
+			Payload: map[string]any{"ticket_id": ticketID},
+		}
+	}
+
+	// Capacity 1: the first reservation fills the trip, the second is refused.
+	if err := reserve("ticket-sr-1", "idem-sr-1"); err != nil {
+		t.Fatalf("reserve ticket-sr-1: %v", err)
+	}
+	if got := seats(); got != 1 {
+		t.Fatalf("seats_reserved = %d, expected 1", got)
+	}
+	if err := reserve("ticket-sr-2", "idem-sr-2"); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("over-capacity reserve error = %v, expected ErrCapacityExceeded", err)
+	}
+
+	// Voiding releases the seat atomically with the transition.
+	if _, err := store.Transition(ctx, "ticket-sr-1", 1, StateVoid, voidEvent("ticket-sr-1", "evt-sr-void")); err != nil {
+		t.Fatalf("void transition: %v", err)
+	}
+	if got := seats(); got != 0 {
+		t.Fatalf("seats_reserved after void = %d, expected 0", got)
+	}
+	// The release is exactly-once: a repeated terminal transition fails on the
+	// version/state guard and cannot double-decrement.
+	if _, err := store.Transition(ctx, "ticket-sr-1", 1, StateVoid, voidEvent("ticket-sr-1", "evt-sr-void-2")); err == nil {
+		t.Fatal("second terminal transition must fail")
+	}
+	if _, err := store.Transition(ctx, "ticket-sr-1", 2, StateVoid, voidEvent("ticket-sr-1", "evt-sr-void-3")); err == nil {
+		t.Fatal("terminal ticket must not transition again")
+	}
+	if got := seats(); got != 0 {
+		t.Fatalf("seats_reserved after rejected retries = %d, expected 0", got)
+	}
+
+	// The freed seat is purchasable again.
+	if err := reserve("ticket-sr-3", "idem-sr-3"); err != nil {
+		t.Fatalf("re-purchase after release: %v", err)
+	}
+	if got := seats(); got != 1 {
+		t.Fatalf("seats_reserved after re-purchase = %d, expected 1", got)
+	}
+	// REFUNDED and EXPIRED release identically.
+	if _, err := store.Transition(ctx, "ticket-sr-3", 1, StateExpired, voidEvent("ticket-sr-3", "evt-sr-expire")); err != nil {
+		t.Fatalf("expire transition: %v", err)
+	}
+	if got := seats(); got != 0 {
+		t.Fatalf("seats_reserved after expiry = %d, expected 0", got)
+	}
+}
+
 func seedTrip(t *testing.T, ctx context.Context, pool *pgxpool.Pool, operatorID, vesselID, tripID string, capacity int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx,
