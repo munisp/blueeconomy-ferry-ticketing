@@ -18,13 +18,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	tigerbeetle "github.com/tigerbeetle/tigerbeetle-go"
+	temporalotel "go.temporal.io/sdk/contrib/opentelemetry"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 	ferryworkflow "github.com/munisp/blueeconomy-ferry-ticketing/internal/workflow"
 )
@@ -104,7 +107,24 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, databaseURL)
+	telemetryConfig, err := telemetry.LoadConfig("blueeconomy-ferry-ticketing")
+	if err != nil {
+		return fmt.Errorf("load telemetry config: %w", err)
+	}
+	pipeline, err := telemetry.Setup(ctx, telemetryConfig)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		// Telemetry flush is bounded at 5s and must never block SIGTERM.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := pipeline.Shutdown(shutdownCtx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err.Error())
+		}
+	}()
+
+	pool, err := telemetry.NewPGXPool(ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}
@@ -131,10 +151,19 @@ func run(logger *slog.Logger) error {
 	// accumulator rollover is lazy by design, so this is the only fare sweep.
 	go runPassExpirySweep(ctx, pool, logger)
 
+	// Temporal OTel interceptors: workflow/activity spans join the service
+	// trace and inbound workflow calls extract the caller's context
+	// (OTEL_DESIGN §3 Temporal row). With telemetry disabled the interceptor
+	// spans are no-ops.
+	tracingInterceptor, err := temporalotel.NewTracingInterceptor(temporalotel.TracerOptions{})
+	if err != nil {
+		return fmt.Errorf("build temporal tracing interceptor: %w", err)
+	}
 	temporalClient, err := client.Dial(client.Options{
-		HostPort:  temporalAddress,
-		Namespace: temporalNamespace,
-		Logger:    logger,
+		HostPort:     temporalAddress,
+		Namespace:    temporalNamespace,
+		Logger:       logger,
+		Interceptors: []interceptor.ClientInterceptor{tracingInterceptor},
 	})
 	if err != nil {
 		return fmt.Errorf("dial temporal: %w", err)
@@ -185,7 +214,9 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{})
+	temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{
+		Interceptors: []interceptor.WorkerInterceptor{tracingInterceptor},
+	})
 	temporalWorker.RegisterWorkflowWithOptions(definition.FerryTicketWorkflow, sdkworkflow.RegisterOptions{Name: "FerryTicketWorkflow"})
 	temporalWorker.RegisterActivityWithOptions(activities.PauseBoarding, activity.RegisterOptions{Name: ferryworkflow.ActivityPauseBoarding})
 	temporalWorker.RegisterActivityWithOptions(activities.MarkTripDeparted, activity.RegisterOptions{Name: ferryworkflow.ActivityMarkTripDeparted})

@@ -6,8 +6,19 @@ import (
 	"errors"
 	"fmt"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
 )
+
+// tracer returns the outbox tracer. With telemetry disabled the global
+// provider is a no-op: drain/publish spans are non-recording and the
+// fail-closed publish semantics are unchanged.
+func tracer() trace.Tracer {
+	return otel.Tracer("github.com/munisp/blueeconomy-ferry-ticketing/internal/outbox")
+}
 
 // Producer publishes one keyed message to one topic. Kafka is the production
 // implementation; tests substitute fakes.
@@ -60,6 +71,10 @@ func Drain(ctx context.Context, source EventSource, router Router, signer *prove
 	if batchSize <= 0 {
 		return 0, errors.New("batch size must be positive")
 	}
+	// Outbox drain span: one traced unit per sweep; publish child spans carry
+	// the injected traceparent into the record headers.
+	ctx, span := tracer().Start(ctx, "ferry.outbox.drain", trace.WithAttributes(attribute.Int("outbox.batch_size", batchSize)))
+	defer span.End()
 	events, err := source.Unpublished(ctx, batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("read outbox: %w", err)

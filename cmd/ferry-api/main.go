@@ -57,7 +57,8 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("setup telemetry: %w", err)
 	}
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Telemetry flush is bounded at 5s and must never block SIGTERM.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := pipeline.Shutdown(shutdownCtx); err != nil {
 			logger.Error("telemetry shutdown failed", "error", err.Error())
@@ -69,7 +70,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("telemetry tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set); explicit no-op tracer active, Prometheus metrics on GET /metrics")
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	pool, err := telemetry.NewPGXPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}

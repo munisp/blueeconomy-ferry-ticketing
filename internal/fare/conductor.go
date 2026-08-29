@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketproof"
@@ -310,6 +312,15 @@ func (service *ConductorService) processPassScan(ctx context.Context, request Ba
 // REVIEW (no settlement); cluster-declined debits are the liability-queue
 // DECLINED outcome (Advisory §9.5: the government's loss, made visible).
 func (service *ConductorService) processOfflineDebit(ctx context.Context, request BatchRequest, scan BatchScan, record ConductorScan) (ConductorScan, error) {
+	// Offline-debit settlement span: cap check + ledger debit as one traced
+	// unit (Advisory §9.5 outcomes are attributes, never swallowed).
+	ctx, span := tracer().Start(ctx, "ferry.offline_debit.settlement",
+		trace.WithAttributes(
+			attribute.String("ferry.device_id", request.DeviceID),
+			attribute.String("ferry.operator_id", request.OperatorID),
+			attribute.Int64("ferry.amount_ngn_minor", scan.AmountNGNMinor),
+		))
+	defer span.End()
 	caps, err := service.store.GetDeviceCaps(ctx, request.DeviceID)
 	if err != nil {
 		if errors.Is(err, ErrDeviceNotProvisioned) {

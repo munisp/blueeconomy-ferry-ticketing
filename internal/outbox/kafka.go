@@ -7,6 +7,10 @@ import (
 	"strings"
 
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 )
 
 // KafkaProducer publishes envelopes to one Kafka topic with all-broker acks.
@@ -40,12 +44,20 @@ func NewKafkaProducer(brokers, topic string) (*KafkaProducer, error) {
 }
 
 // Publish writes one keyed message. The key is the outbox event ID, making
-// at-least-once replays idempotent for downstream consumers.
+// at-least-once replays idempotent for downstream consumers. The live W3C
+// traceparent/baggage context is injected into the record headers so
+// consumers join this trace (manual carrier — kafka-go has no
+// auto-instrumentation).
 func (producer *KafkaProducer) Publish(ctx context.Context, key, value []byte) error {
 	if len(key) == 0 || len(value) == 0 {
 		return errors.New("Kafka key and value are required")
 	}
-	if err := producer.writer.WriteMessages(ctx, kafka.Message{Key: key, Value: value}); err != nil {
+	ctx, span := tracer().Start(ctx, "ferry.outbox.publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attribute.String("messaging.destination.name", producer.writer.Topic)))
+	defer span.End()
+	message := kafka.Message{Key: key, Value: value, Headers: telemetry.InjectKafkaHeaders(ctx, nil)}
+	if err := producer.writer.WriteMessages(ctx, message); err != nil {
 		return fmt.Errorf("write Kafka message: %w", err)
 	}
 	return nil

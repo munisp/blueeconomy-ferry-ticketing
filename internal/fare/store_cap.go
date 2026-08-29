@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
@@ -66,6 +68,15 @@ func WeekPeriodStart(t time.Time) time.Time {
 // lazy: period rows are keyed by the derived period start, so a new period
 // simply starts a new row.
 func (store *PostgresStore) PriceJourney(ctx context.Context, in PriceInput, event ticketing.Event) (CapJourney, error) {
+	// Fare-capping atomic transaction span: concession/transfer pricing plus
+	// the accumulator-locked cap decision commit as one traced unit.
+	ctx, span := tracer().Start(ctx, "ferry.fare_capping.atomic_tx",
+		trace.WithAttributes(
+			attribute.String("ferry.journey_id", in.JourneyID),
+			attribute.String("ferry.trip_id", in.TripID),
+			attribute.String("ferry.operator_id", in.OperatorID),
+		))
+	defer span.End()
 	if in.JourneyID == "" || in.SubjectRef == "" || in.TripID == "" || in.StandardFareMinor < 0 {
 		return CapJourney{}, errors.New("journey id, subject, trip and non-negative fare are required")
 	}

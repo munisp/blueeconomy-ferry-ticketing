@@ -15,11 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/outbox"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/provenance"
+	"github.com/munisp/blueeconomy-ferry-ticketing/internal/telemetry"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
 
@@ -50,7 +49,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, databaseURL)
+	telemetryConfig, err := telemetry.LoadConfig("blueeconomy-ferry-ticketing")
+	if err != nil {
+		return fmt.Errorf("load telemetry config: %w", err)
+	}
+	pipeline, err := telemetry.Setup(ctx, telemetryConfig)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		// Telemetry flush is bounded at 5s and must never block SIGTERM.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := pipeline.Shutdown(shutdownCtx); err != nil {
+			log.Printf("outbox-publisher: telemetry shutdown failed: %v", err)
+		}
+	}()
+
+	pool, err := telemetry.NewPGXPool(ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}

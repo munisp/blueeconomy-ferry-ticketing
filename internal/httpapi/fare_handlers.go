@@ -10,10 +10,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/auth"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/fare"
 )
+
+// tracer returns the HTTP-surface tracer. With telemetry disabled the global
+// provider is a no-op and spans are non-recording.
+func tracer() trace.Tracer {
+	return otel.Tracer("github.com/munisp/blueeconomy-ferry-ticketing/internal/httpapi")
+}
 
 // RoleConductor authenticates conductor store-and-forward uploads at the
 // service level (device-management plane is TODO W-FEAT-3).
@@ -588,7 +596,12 @@ func (server *Server) railWebhook(writer http.ResponseWriter, request *http.Requ
 		writeError(writer, http.StatusBadRequest, "request body is invalid")
 		return
 	}
-	if err := server.fare.Accounts.VerifyWebhookSignature(raw, request.Header.Get("X-Rail-Signature")); err != nil {
+	// Top-up webhook HMAC verify span: the authentication boundary of the
+	// only rail-credit path is always traced.
+	_, verifySpan := tracer().Start(request.Context(), "ferry.topup_webhook.hmac_verify")
+	err = server.fare.Accounts.VerifyWebhookSignature(raw, request.Header.Get("X-Rail-Signature"))
+	verifySpan.End()
+	if err != nil {
 		writeFareError(writer, err)
 		return
 	}

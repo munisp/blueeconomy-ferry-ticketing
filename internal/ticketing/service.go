@@ -7,9 +7,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer returns the package tracer. With telemetry disabled (no OTLP
+// endpoint) the global provider is a no-op and every span is non-recording —
+// telemetry never gates the business path.
+func tracer() trace.Tracer {
+	return otel.Tracer("github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing")
+}
 
 // traceTicketTransition annotates the active request span (when any) with the
 // approved booking state transition. With the no-op tracer this is a no-op.
@@ -210,6 +218,15 @@ func NewService(store Store, ledger Ledger, manifestSalt string, options ...Serv
 // agent channel) and issues the ticket. Replay of the same idempotency key
 // returns the original ticket.
 func (service *Service) Purchase(ctx context.Context, request PurchaseRequest) (Ticket, error) {
+	// Booking saga span: RESERVED → PAID → ISSUED (or the idempotent-replay
+	// tail). Ledger and store child spans carry their own failure detail; the
+	// transition attributes land on this span via traceTicketTransition.
+	ctx, span := tracer().Start(ctx, "ferry.booking.purchase_saga",
+		trace.WithAttributes(
+			attribute.String("ferry.trip_id", request.TripID),
+			attribute.String("ferry.channel", string(request.Channel)),
+		))
+	defer span.End()
 	if err := request.Validate(); err != nil {
 		return Ticket{}, err
 	}

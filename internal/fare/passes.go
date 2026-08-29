@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
 )
@@ -116,6 +118,14 @@ func (service *PassService) CreatePassProduct(ctx context.Context, product PassP
 // Purchase runs the pass purchase saga. Replay of the same idempotency key
 // returns the original pass (never a second charge).
 func (service *PassService) Purchase(ctx context.Context, request PassPurchaseRequest) (Pass, error) {
+	// BlueFare pass saga span: RESERVED → PAID → ISSUED across the ledger
+	// reserve/post and the store transitions (child spans carry detail).
+	ctx, span := tracer().Start(ctx, "ferry.bluefare.pass_saga",
+		trace.WithAttributes(
+			attribute.String("ferry.pass_product_id", request.ProductID),
+			attribute.String("ferry.channel", request.Channel),
+		))
+	defer span.End()
 	if err := request.Validate(); err != nil {
 		return Pass{}, err
 	}

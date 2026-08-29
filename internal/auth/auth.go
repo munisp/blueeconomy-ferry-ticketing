@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Principal is the authenticated caller: the Keycloak subject, its realm and
@@ -145,7 +147,9 @@ func NewOIDCAuthenticator(issuer, audience string, jwksURL *url.URL, caFile stri
 		Audience: audience,
 		JWKSURL:  jwksURL,
 		client: &http.Client{
-			Transport: transport,
+			// otelhttp transport: JWKS fetches become CLIENT spans and
+			// forward the live trace context (no-op when telemetry disabled).
+			Transport: otelhttp.NewTransport(transport),
 			Timeout:   10 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return errors.New("JWKS redirects are not permitted")
