@@ -48,10 +48,12 @@ func (headerAuthenticator) Authenticate(request *http.Request) (auth.Principal, 
 }
 
 type fakeTicketService struct {
-	purchased []ticketing.PurchaseRequest
-	ticket    ticketing.Ticket
-	err       error
-	refundErr error
+	purchased     []ticketing.PurchaseRequest
+	ticket        ticketing.Ticket
+	err           error
+	refundErr     error
+	voidErr       error
+	voidPrincipal string
 }
 
 func (service *fakeTicketService) Purchase(_ context.Context, request ticketing.PurchaseRequest) (ticketing.Ticket, error) {
@@ -69,7 +71,11 @@ func (service *fakeTicketService) Refund(_ context.Context, ticketID, principal,
 	return ticketing.Ticket{TicketID: ticketID, State: ticketing.StateRefunded}, nil
 }
 
-func (service *fakeTicketService) Void(_ context.Context, ticketID, correlationID string) (ticketing.Ticket, error) {
+func (service *fakeTicketService) Void(_ context.Context, ticketID, principal, principalRole, correlationID string) (ticketing.Ticket, error) {
+	service.voidPrincipal = principal
+	if service.voidErr != nil {
+		return ticketing.Ticket{}, service.voidErr
+	}
 	return ticketing.Ticket{TicketID: ticketID, State: ticketing.StateVoid}, nil
 }
 
@@ -338,6 +344,20 @@ func TestRefundBoardedTicketConflict(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusConflict, recorder.Code)
+}
+
+// TestVoidAboveThresholdConflict is the FE-7 edge regression: a
+// single-officer void above the dual-control threshold maps to 409, and the
+// acting officer's verified identity reaches the service.
+func TestVoidAboveThresholdConflict(t *testing.T) {
+	server, tickets, _, _, _ := newTestServer(t)
+	tickets.voidErr = ticketing.ErrVoidApprovalRequired
+	officer := auth.Principal{Subject: "officer-1", Roles: map[string]struct{}{RoleOperator: {}}, OperatorID: "op-1"}
+	request := withAuth(httptest.NewRequest(http.MethodPost, "/v1/tickets/ticket-1/void", nil), officer)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	require.Equal(t, "officer-1", tickets.voidPrincipal, "actor identity comes from verified claims")
 }
 
 func TestPurchaseHappyPath(t *testing.T) {

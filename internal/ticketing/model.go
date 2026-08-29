@@ -51,6 +51,10 @@ var (
 	// the service guard and by the tickets_block_boarded_refund trigger so no
 	// code path can bypass it.
 	ErrTicketBoarded = errors.New("ticket boarding has been consumed; refund and void are not permitted")
+	// ErrVoidApprovalRequired rejects a single-officer void of a sold ticket
+	// at or above the dual-control threshold: a second, distinct officer
+	// must confirm the recorded approval request (maker-checker).
+	ErrVoidApprovalRequired = errors.New("void requires a second officer approval")
 )
 
 // transitions is the complete, approved state graph. Anything not listed

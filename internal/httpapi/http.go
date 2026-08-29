@@ -47,7 +47,7 @@ var oversightRoles = []string{
 type TicketService interface {
 	Purchase(ctx context.Context, request ticketing.PurchaseRequest) (ticketing.Ticket, error)
 	Refund(ctx context.Context, ticketID, principal, principalRole, correlationID string) (ticketing.Ticket, error)
-	Void(ctx context.Context, ticketID, correlationID string) (ticketing.Ticket, error)
+	Void(ctx context.Context, ticketID, principal, principalRole, correlationID string) (ticketing.Ticket, error)
 	Expire(ctx context.Context, ticketID, correlationID string) (ticketing.Ticket, error)
 }
 
@@ -262,6 +262,8 @@ func writeDomainError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusConflict, "state transition is not permitted")
 	case errors.Is(err, ticketing.ErrTicketBoarded):
 		writeError(writer, http.StatusConflict, "ticket boarding has been consumed; refund is not permitted")
+	case errors.Is(err, ticketing.ErrVoidApprovalRequired):
+		writeError(writer, http.StatusConflict, "void requires a second officer approval")
 	case errors.Is(err, ticketing.ErrIdempotencyConflict):
 		writeError(writer, http.StatusConflict, "idempotency key conflict")
 	default:

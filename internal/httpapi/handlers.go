@@ -115,7 +115,11 @@ func (server *Server) voidTicket(writer http.ResponseWriter, request *http.Reque
 		writeError(writer, http.StatusForbidden, "forbidden")
 		return
 	}
-	voided, err := server.tickets.Void(request.Context(), ticket.TicketID, correlationID(request))
+	role := RoleOperator
+	if resolved.HasRole(RoleStateOfficer) && !resolved.HasRole(RoleOperator) {
+		role = RoleStateOfficer
+	}
+	voided, err := server.tickets.Void(request.Context(), ticket.TicketID, resolved.Subject, role, correlationID(request))
 	if err != nil {
 		writeDomainError(writer, err)
 		return

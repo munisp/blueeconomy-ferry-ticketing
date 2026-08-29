@@ -38,6 +38,11 @@ type Config struct {
 	AgentFloatAccount             string
 	PendingTransferTimeoutSeconds uint32
 
+	// VoidDualControlThresholdNGNMinor is the fare (kobo) at or above which
+	// voiding a sold ticket requires a second officer (maker-checker).
+	// Unset means 0: dual control for every PAID/ISSUED void (fail closed).
+	VoidDualControlThresholdNGNMinor int64
+
 	TicketSigningKeyFile         string
 	TicketPreviousSigningKeyFile string
 	TicketPreviousKeyGraceUntil  time.Time
@@ -122,6 +127,15 @@ func Load() (Config, error) {
 	}
 	if config.PendingTransferTimeoutSeconds, err = parseNonZeroUint32("FERRY_TB_PENDING_TIMEOUT_SECONDS"); err != nil {
 		return Config{}, err
+	}
+	// Optional money-path knob; unset fails closed to dual control on every
+	// sold-ticket void (threshold 0).
+	if threshold := strings.TrimSpace(os.Getenv("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR")); threshold != "" {
+		parsed, parseErr := strconv.ParseInt(threshold, 10, 64)
+		if parseErr != nil || parsed < 0 {
+			return Config{}, errors.New("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR must be a non-negative integer")
+		}
+		config.VoidDualControlThresholdNGNMinor = parsed
 	}
 	if err := config.loadTicketProof(); err != nil {
 		return Config{}, err

@@ -41,6 +41,32 @@ func TestLoadValidatesJWTMode(t *testing.T) {
 	require.Equal(t, uint32(900), config.PendingTransferTimeoutSeconds)
 }
 
+// TestVoidDualControlThresholdDefaultsFailClosed pins the money-path knob:
+// unset means dual control on every sold-ticket void (threshold 0), an
+// explicit value relaxes it, and a malformed value fails closed.
+func TestVoidDualControlThresholdDefaultsFailClosed(t *testing.T) {
+	validEnv(t)
+	config, err := Load()
+	require.NoError(t, err)
+	require.Zero(t, config.VoidDualControlThresholdNGNMinor, "unset threshold fails closed to dual control on every sold void")
+
+	validEnv(t)
+	t.Setenv("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR", "5000000")
+	config, err = Load()
+	require.NoError(t, err)
+	require.Equal(t, int64(5000000), config.VoidDualControlThresholdNGNMinor)
+
+	validEnv(t)
+	t.Setenv("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR", "-1")
+	_, err = Load()
+	require.Error(t, err, "negative threshold fails closed")
+
+	validEnv(t)
+	t.Setenv("FERRY_VOID_DUAL_CONTROL_THRESHOLD_NGN_MINOR", "not-a-number")
+	_, err = Load()
+	require.Error(t, err, "malformed threshold fails closed")
+}
+
 func TestLoadFailsClosedOnMissingValues(t *testing.T) {
 	validEnv(t)
 	t.Setenv("FERRY_DATABASE_URL", "")

@@ -403,6 +403,77 @@ func TestBoardedRefundGuardIntegration(t *testing.T) {
 	}
 }
 
+// TestVoidApprovalDualControlIntegration proves the maker-checker
+// persistence contract: one pending approval per ticket, single consumption,
+// and the audit event written atomically with the request.
+func TestVoidApprovalDualControlIntegration(t *testing.T) {
+	ctx := context.Background()
+	pool := openIntegrationPool(t, ctx)
+	defer pool.Close()
+
+	seedTrip(t, ctx, pool, "op-int", "vessel-int", "trip-int", 2)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tickets (ticket_id, trip_id, operator_id, passenger_digest_sha256, fare_ngn_minor, channel, state, version, purchaser_principal, correlation_id)
+		 VALUES ('ticket-va-1', 'trip-int', 'op-int', $1, 250000, 'DIRECT', 'PAID', 2, 'kc-integration-buyer', 'corr-va-1')`,
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatalf("insert paid ticket: %v", err)
+	}
+	store, err := NewPostgresStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.GetVoidApproval(ctx, "ticket-va-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("no pending approval expected, got %v", err)
+	}
+	request := VoidApproval{
+		TicketID: "ticket-va-1", RequestedBy: "officer-1",
+		AmountNGNMinor: 250000, CorrelationID: "corr-va-1",
+	}
+	if err := store.RequestVoidApproval(ctx, request, Event{
+		EventID: "evt-va-1", Topic: TopicTicketing, SubjectID: "ticket-va-1",
+		EventType: EventVoidApprovalRequested, CorrelationID: "corr-va-1",
+		Payload: map[string]any{"ticket_id": "ticket-va-1", "principal_id": "officer-1"},
+	}); err != nil {
+		t.Fatalf("request void approval: %v", err)
+	}
+	pending, err := store.GetVoidApproval(ctx, "ticket-va-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.RequestedBy != "officer-1" || pending.AmountNGNMinor != 250000 {
+		t.Fatalf("unexpected approval: %+v", pending)
+	}
+	// One pending approval per ticket.
+	if err := store.RequestVoidApproval(ctx, request, Event{
+		EventID: "evt-va-2", Topic: TopicTicketing, SubjectID: "ticket-va-1",
+		EventType: EventVoidApprovalRequested, CorrelationID: "corr-va-1",
+		Payload: map[string]any{"ticket_id": "ticket-va-1"},
+	}); err == nil {
+		t.Fatal("duplicate pending approval must be rejected")
+	}
+	// The confirming officer consumes it exactly once.
+	if err := store.ConsumeVoidApproval(ctx, "ticket-va-1", "officer-2"); err != nil {
+		t.Fatalf("consume void approval: %v", err)
+	}
+	if err := store.ConsumeVoidApproval(ctx, "ticket-va-1", "officer-3"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second consume must fail, got %v", err)
+	}
+	if _, err := store.GetVoidApproval(ctx, "ticket-va-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("consumed approval must not be pending, got %v", err)
+	}
+	// The request and its audit event committed atomically.
+	var eventCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ferry_outbox WHERE event_type = $1 AND subject_id = 'ticket-va-1'`,
+		EventVoidApprovalRequested).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("void approval audit events = %d, expected 1", eventCount)
+	}
+}
+
 func seedTrip(t *testing.T, ctx context.Context, pool *pgxpool.Pool, operatorID, vesselID, tripID string, capacity int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx,

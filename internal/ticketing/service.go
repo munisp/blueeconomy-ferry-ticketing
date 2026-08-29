@@ -47,7 +47,10 @@ const (
 	EventTicketExpired    = "ferry.ticket.expired"
 	EventTicketVoided     = "ferry.ticket.voided"
 	EventAgentCashIn      = "ferry.agent.cash_in_recorded"
-	EventManifestExported = "ferry.manifest.exported"
+	// EventVoidApprovalRequested audits the maker half of a dual-control
+	// void: the first officer's request a second officer must confirm.
+	EventVoidApprovalRequested = "ferry.ticket.void_approval_requested"
+	EventManifestExported      = "ferry.manifest.exported"
 	// EventManifestIncomplete audits a departure without a manifest.
 	EventManifestIncomplete = "ferry.manifest.incomplete"
 	EventAdverseWeather     = "ferry.adverse_weather.alerted"
@@ -113,6 +116,15 @@ type Store interface {
 	// VOID) with optimistic concurrency and the outbox event.
 	Transition(ctx context.Context, ticketID string, version int64, to State, event Event) (Ticket, error)
 	GetTrip(ctx context.Context, tripID string) (Trip, error)
+	// GetVoidApproval returns the pending (unconsumed) dual-control void
+	// approval for a ticket, ErrNotFound when none exists.
+	GetVoidApproval(ctx context.Context, ticketID string) (VoidApproval, error)
+	// RequestVoidApproval records the maker half of a dual-control void with
+	// its audit event in one transaction.
+	RequestVoidApproval(ctx context.Context, approval VoidApproval, event Event) error
+	// ConsumeVoidApproval marks the pending approval spent by the confirming
+	// (checker) officer; it fails when no pending approval exists.
+	ConsumeVoidApproval(ctx context.Context, ticketID, confirmedBy string) error
 	// ListReservedBefore returns up to limit RESERVED tickets created before
 	// cutoff, oldest first (reconciler sweep input).
 	ListReservedBefore(ctx context.Context, cutoff time.Time, limit int) ([]Ticket, error)
@@ -130,16 +142,49 @@ type CashIn struct {
 	LedgerTransferID string
 }
 
+// VoidApproval is the maker-checker record for voiding one sold ticket: the
+// requesting (maker) officer, the fare at stake, and — once spent — the
+// confirming (checker) officer.
+type VoidApproval struct {
+	TicketID       string
+	RequestedBy    string
+	AmountNGNMinor int64
+	CorrelationID  string
+	CreatedAt      time.Time
+}
+
+// ServiceOption tunes optional service behaviour. Money-path knobs fail
+// closed by default and only relax via explicit configuration.
+type ServiceOption func(*Service) error
+
+// WithVoidDualControlThreshold sets the fare (NGN minor units) at or above
+// which voiding a sold ticket requires a second officer's confirmation. The
+// default is 0: every PAID/ISSUED void requires dual control unless the
+// operator explicitly relaxes the threshold.
+func WithVoidDualControlThreshold(thresholdNGNMinor int64) ServiceOption {
+	return func(service *Service) error {
+		if thresholdNGNMinor < 0 {
+			return errors.New("void dual-control threshold must be non-negative")
+		}
+		service.voidDualControlThreshold = thresholdNGNMinor
+		return nil
+	}
+}
+
 // Service orchestrates purchase, payment, issue and refund.
 type Service struct {
 	store  Store
 	ledger Ledger
 	salt   string
 	now    func() time.Time
+	// voidDualControlThreshold is the fare (NGN minor) at or above which a
+	// sold-ticket void requires a second officer (maker-checker). Default 0:
+	// dual control for every sold-ticket void.
+	voidDualControlThreshold int64
 }
 
 // NewService fails closed on any missing dependency.
-func NewService(store Store, ledger Ledger, manifestSalt string) (*Service, error) {
+func NewService(store Store, ledger Ledger, manifestSalt string, options ...ServiceOption) (*Service, error) {
 	if store == nil {
 		return nil, errors.New("ticket store is required")
 	}
@@ -149,7 +194,13 @@ func NewService(store Store, ledger Ledger, manifestSalt string) (*Service, erro
 	if len(manifestSalt) < 16 {
 		return nil, errors.New("manifest salt of at least 16 characters is required")
 	}
-	return &Service{store: store, ledger: ledger, salt: manifestSalt, now: func() time.Time { return time.Now().UTC() }}, nil
+	service := &Service{store: store, ledger: ledger, salt: manifestSalt, now: func() time.Time { return time.Now().UTC() }}
+	for _, option := range options {
+		if err := option(service); err != nil {
+			return nil, err
+		}
+	}
+	return service, nil
 }
 
 // Purchase reserves a seat (capacity enforced in the store transaction),
@@ -471,18 +522,114 @@ func (service *Service) Reconcile(ctx context.Context, completionAge, expiryAge 
 	return report, nil
 }
 
-// Void cancels a ticket without a ledger refund (void before settlement).
-func (service *Service) Void(ctx context.Context, ticketID, correlationID string) (Ticket, error) {
+// Void cancels a ticket. Money semantics by state, chosen so the fare can
+// never sit in operator revenue without a corresponding refund entry:
+//
+//   - RESERVED (pre-settlement): the pending reserve is voided; the passenger
+//     was never charged, so no refund transfer and no dual control.
+//   - PAID/ISSUED (sold): the void issues the refund transfer (operator
+//     revenue -> passenger clearing) in the same flow, and — at or above the
+//     configured dual-control threshold — requires maker-checker: the first
+//     officer records a void approval, a second, distinct officer confirms
+//     it by re-issuing the void.
+//
+// A boarding-consumed ticket can never be voided (ErrTicketBoarded; the fare
+// is earned), mirrored by the tickets_block_boarded_refund trigger.
+func (service *Service) Void(ctx context.Context, ticketID, principal, principalRole, correlationID string) (Ticket, error) {
+	if principal == "" {
+		return Ticket{}, errors.New("void principal is required")
+	}
 	ticket, err := service.store.GetTicket(ctx, ticketID)
 	if err != nil {
 		return Ticket{}, err
 	}
-	if ticket.State == StateReserved && ticket.LedgerReserveID != "" {
-		if err := service.ledger.Void(ctx, ticket.LedgerReserveID); err != nil {
-			return Ticket{}, fmt.Errorf("void pending ledger reserve: %w", err)
+	if !ValidTransition(ticket.State, StateVoid) {
+		return Ticket{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, ticket.State, StateVoid)
+	}
+	if ticket.BoardedAt != nil || ticket.Embarked {
+		return Ticket{}, ErrTicketBoarded
+	}
+	traceTicketTransition(ctx, ticket, StateVoid)
+	if ticket.State == StateReserved {
+		if ticket.LedgerReserveID != "" {
+			if err := service.ledger.Void(ctx, ticket.LedgerReserveID); err != nil {
+				return Ticket{}, fmt.Errorf("void pending ledger reserve: %w", err)
+			}
+		}
+		return service.voidTransition(ctx, ticket, "", principal, principalRole, correlationID)
+	}
+
+	// Sold ticket: dual control at or above the threshold.
+	dualControl := ticket.FareNGNMinor >= service.voidDualControlThreshold
+	if dualControl {
+		approval, err := service.store.GetVoidApproval(ctx, ticketID)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				return Ticket{}, fmt.Errorf("load void approval: %w", err)
+			}
+			// Maker: record the request for a second officer to confirm.
+			request := VoidApproval{
+				TicketID:       ticketID,
+				RequestedBy:    principal,
+				AmountNGNMinor: ticket.FareNGNMinor,
+				CorrelationID:  correlationID,
+			}
+			if err := service.store.RequestVoidApproval(ctx, request, Event{
+				EventID:       uuid.NewString(),
+				Topic:         TopicTicketing,
+				SubjectID:     ticketID,
+				EventType:     EventVoidApprovalRequested,
+				CorrelationID: correlationID,
+				Payload: map[string]any{
+					"ticket_id":        ticketID,
+					"principal_id":     principal,
+					"principal_role":   principalRole,
+					"amount_ngn_minor": ticket.FareNGNMinor,
+				},
+			}); err != nil {
+				return Ticket{}, fmt.Errorf("record void approval request: %w", err)
+			}
+			return Ticket{}, ErrVoidApprovalRequired
+		}
+		if approval.RequestedBy == principal {
+			// Maker-checker: the requesting officer can never self-approve.
+			return Ticket{}, fmt.Errorf("%w: the requesting officer cannot self-approve", ErrVoidApprovalRequired)
 		}
 	}
-	return service.terminal(ctx, ticketID, StateVoid, EventTicketVoided, correlationID)
+
+	refundID, err := service.ledger.Refund(ctx, ticket.TicketID, ticket.FareNGNMinor)
+	if err != nil {
+		return Ticket{}, fmt.Errorf("refund fare on ledger: %w", err)
+	}
+	if dualControl {
+		if err := service.store.ConsumeVoidApproval(ctx, ticketID, principal); err != nil {
+			return Ticket{}, fmt.Errorf("consume void approval: %w", err)
+		}
+	}
+	return service.voidTransition(ctx, ticket, refundID, principal, principalRole, correlationID)
+}
+
+// voidTransition applies the VOID transition with the acting officer (from
+// verified claims, never client-supplied identity) and the refund transfer
+// reference in the outbox event.
+func (service *Service) voidTransition(ctx context.Context, ticket Ticket, refundID, principal, principalRole, correlationID string) (Ticket, error) {
+	payload := map[string]any{
+		"ticket_id":      ticket.TicketID,
+		"principal_id":   principal,
+		"principal_role": principalRole,
+		"state":          string(StateVoid),
+	}
+	if refundID != "" {
+		payload["ledger_transfer_id"] = refundID
+	}
+	return service.store.Transition(ctx, ticket.TicketID, ticket.Version, StateVoid, Event{
+		EventID:       uuid.NewString(),
+		Topic:         TopicTicketing,
+		SubjectID:     ticket.TicketID,
+		EventType:     EventTicketVoided,
+		CorrelationID: correlationID,
+		Payload:       payload,
+	})
 }
 
 func (service *Service) terminal(ctx context.Context, ticketID string, to State, eventType, correlationID string) (Ticket, error) {

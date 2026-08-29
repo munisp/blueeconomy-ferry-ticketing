@@ -342,6 +342,68 @@ func (store *PostgresStore) listTicketsByStateBefore(ctx context.Context, state 
 	return tickets, rows.Err()
 }
 
+// GetVoidApproval implements Store.
+func (store *PostgresStore) GetVoidApproval(ctx context.Context, ticketID string) (VoidApproval, error) {
+	var approval VoidApproval
+	err := store.pool.QueryRow(ctx,
+		`SELECT ticket_id, requested_by, amount_ngn_minor, correlation_id, created_at
+		 FROM void_approvals WHERE ticket_id = $1 AND consumed_at IS NULL`, ticketID).
+		Scan(&approval.TicketID, &approval.RequestedBy, &approval.AmountNGNMinor, &approval.CorrelationID, &approval.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return VoidApproval{}, ErrNotFound
+		}
+		return VoidApproval{}, fmt.Errorf("load void approval: %w", err)
+	}
+	return approval, nil
+}
+
+// RequestVoidApproval implements Store: the maker half of the dual-control
+// void, with its audit event in the same transaction. A second request for
+// the same ticket fails on the primary key (one pending approval per ticket).
+func (store *PostgresStore) RequestVoidApproval(ctx context.Context, approval VoidApproval, event Event) error {
+	if approval.TicketID == "" || approval.RequestedBy == "" || approval.AmountNGNMinor <= 0 || approval.CorrelationID == "" {
+		return errors.New("void approval ticket, requesting officer, amount and correlation id are required")
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin void approval transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO void_approvals (ticket_id, requested_by, amount_ngn_minor, correlation_id)
+		 VALUES ($1, $2, $3, $4)`,
+		approval.TicketID, approval.RequestedBy, approval.AmountNGNMinor, approval.CorrelationID); err != nil {
+		return fmt.Errorf("insert void approval: %w", err)
+	}
+	if err := insertEventTx(ctx, tx, event); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit void approval: %w", err)
+	}
+	return nil
+}
+
+// ConsumeVoidApproval implements Store: marks the pending approval spent by
+// the confirming officer. It fails closed when no pending approval exists
+// (already consumed or never requested).
+func (store *PostgresStore) ConsumeVoidApproval(ctx context.Context, ticketID, confirmedBy string) error {
+	if confirmedBy == "" {
+		return errors.New("confirming officer is required")
+	}
+	result, err := store.pool.Exec(ctx,
+		`UPDATE void_approvals SET consumed_at = now(), consumed_by = $2
+		 WHERE ticket_id = $1 AND consumed_at IS NULL`, ticketID, confirmedBy)
+	if err != nil {
+		return fmt.Errorf("consume void approval: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("consume void approval for %s: %w", ticketID, ErrNotFound)
+	}
+	return nil
+}
+
 // GetTrip implements Store.
 func (store *PostgresStore) GetTrip(ctx context.Context, tripID string) (Trip, error) {
 	return getTripQuerier(ctx, store.pool, tripID)

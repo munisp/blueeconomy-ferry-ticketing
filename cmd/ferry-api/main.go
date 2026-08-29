@@ -133,7 +133,8 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	ticketService, err := ticketing.NewService(ticketStore, ledgerService, cfg.ManifestSalt)
+	ticketService, err := ticketing.NewService(ticketStore, ledgerService, cfg.ManifestSalt,
+		ticketing.WithVoidDualControlThreshold(cfg.VoidDualControlThresholdNGNMinor))
 	if err != nil {
 		return err
 	}

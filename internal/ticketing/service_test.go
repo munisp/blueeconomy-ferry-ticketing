@@ -24,6 +24,8 @@ type fakeStore struct {
 	events        []Event
 	// markPaidErr injects a MarkPaid failure (purchase-saga fault injection).
 	markPaidErr error
+	// voidApprovals holds pending dual-control void requests (maker-checker).
+	voidApprovals map[string]VoidApproval
 }
 
 func newFakeStore() *fakeStore {
@@ -32,6 +34,7 @@ func newFakeStore() *fakeStore {
 		tickets:       make(map[string]Ticket),
 		keys:          make(map[string]string),
 		keyPrincipals: make(map[string]string),
+		voidApprovals: make(map[string]VoidApproval),
 	}
 }
 
@@ -178,6 +181,41 @@ func (store *fakeStore) listByStateBefore(state State, cutoff time.Time, limit i
 		out = out[:limit]
 	}
 	return out
+}
+
+func (store *fakeStore) GetVoidApproval(_ context.Context, ticketID string) (VoidApproval, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	approval, ok := store.voidApprovals[ticketID]
+	if !ok {
+		return VoidApproval{}, ErrNotFound
+	}
+	return approval, nil
+}
+
+func (store *fakeStore) RequestVoidApproval(_ context.Context, approval VoidApproval, event Event) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if _, exists := store.voidApprovals[approval.TicketID]; exists {
+		return fmt.Errorf("void approval already pending for %s", approval.TicketID)
+	}
+	approval.CreatedAt = time.Now().UTC()
+	store.voidApprovals[approval.TicketID] = approval
+	store.events = append(store.events, event)
+	return nil
+}
+
+func (store *fakeStore) ConsumeVoidApproval(_ context.Context, ticketID, confirmedBy string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if confirmedBy == "" {
+		return fmt.Errorf("confirming officer is required")
+	}
+	if _, exists := store.voidApprovals[ticketID]; !exists {
+		return fmt.Errorf("consume void approval for %s: %w", ticketID, ErrNotFound)
+	}
+	delete(store.voidApprovals, ticketID)
+	return nil
 }
 
 func (store *fakeStore) ListReservedBefore(_ context.Context, cutoff time.Time, limit int) ([]Ticket, error) {
@@ -566,7 +604,7 @@ func TestVoidReleasesPendingReserve(t *testing.T) {
 		Version: 1, LedgerReserveID: "reserve-ticket-r", FareNGNMinor: 250000,
 		PurchaserPrincipal: "subject-1", Channel: ChannelDirect, PassengerDigest: "digest",
 	}
-	voided, err := service.Void(context.Background(), "ticket-r", "corr-void")
+	voided, err := service.Void(context.Background(), "ticket-r", "officer-1", "operator", "corr-void")
 	require.NoError(t, err)
 	require.Equal(t, StateVoid, voided.State)
 	require.Contains(t, ledger.voided, "reserve-ticket-r")
@@ -608,10 +646,10 @@ func TestTerminalTransitionsReleaseSeat(t *testing.T) {
 	require.Equal(t, 2, store.trips["trip-1"].SeatsReserved, "trip full again")
 	_, err = service.Purchase(context.Background(), purchaseRequest("key-4"))
 	require.ErrorIs(t, err, ErrCapacityExceeded)
-	_, err = service.Void(context.Background(), reserved.TicketID, "corr-void")
+	_, err = service.Void(context.Background(), reserved.TicketID, "officer-1", "operator", "corr-void")
 	require.NoError(t, err)
 	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "void releases the seat")
-	_, err = service.Void(context.Background(), reserved.TicketID, "corr-void-2")
+	_, err = service.Void(context.Background(), reserved.TicketID, "officer-1", "operator", "corr-void-2")
 	require.ErrorIs(t, err, ErrInvalidTransition, "void of a terminal ticket fails closed")
 	require.Equal(t, 1, store.trips["trip-1"].SeatsReserved, "no double release")
 
@@ -620,4 +658,120 @@ func TestTerminalTransitionsReleaseSeat(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StateIssued, second.State)
 	require.Equal(t, 2, store.trips["trip-1"].SeatsReserved)
+}
+
+// seedSoldTicket inserts one PAID ticket (fare settled, not yet issued) for
+// void-flow tests.
+func seedSoldTicket(store *fakeStore, ticketID string) Ticket {
+	ticket := Ticket{
+		TicketID: ticketID, TripID: "trip-1", OperatorID: "op-1",
+		PassengerDigest: "digest", FareNGNMinor: 250000, Channel: ChannelDirect,
+		State: StatePaid, Version: 2, LedgerReserveID: "reserve-" + ticketID,
+		LedgerPostID: "post-reserve-" + ticketID,
+		PurchaserPrincipal: "subject-1", CorrelationID: "corr-" + ticketID,
+	}
+	store.tickets[ticketID] = ticket
+	return ticket
+}
+
+// TestVoidPaidTicketRefundsFare is the FE-2 regression: voiding a sold
+// ticket below the dual-control threshold moves the fare back (revenue ->
+// clearing) in the same flow; the fare never stays in revenue without a
+// refund entry.
+func TestVoidPaidTicketRefundsFare(t *testing.T) {
+	store := newFakeStore()
+	store.trips["trip-1"] = Trip{
+		TripID: "trip-1", VesselID: "vessel-1", OperatorID: "op-1",
+		RouteReference: "route-1", TerminalReference: "terminal-1",
+		ScheduledDeparture: time.Now().Add(2 * time.Hour), FareNGNMinor: 250000,
+		Capacity: 2, SeatsReserved: 1, Status: "SCHEDULED",
+	}
+	ledger := &fakeLedger{}
+	// Threshold above the fare: single-officer void with refund is allowed.
+	service, err := NewService(store, ledger, testSalt, WithVoidDualControlThreshold(100000000))
+	require.NoError(t, err)
+	ticket := seedSoldTicket(store, "ticket-sold")
+
+	voided, err := service.Void(context.Background(), ticket.TicketID, "officer-1", "operator", "corr-void")
+	require.NoError(t, err)
+	require.Equal(t, StateVoid, voided.State)
+	require.Equal(t, []string{ticket.TicketID}, ledger.refunded, "void of a sold ticket refunds the fare")
+	require.Equal(t, []int64{ticket.FareNGNMinor}, ledger.refundedAmounts, "balanced: refund equals the fare")
+	require.Empty(t, ledger.voided, "a settled fare is refunded, never voided (void covers only pending)")
+	require.Equal(t, 0, store.trips["trip-1"].SeatsReserved, "void releases the seat")
+	foundRefundRef := false
+	for _, event := range store.events {
+		if event.EventType == EventTicketVoided && event.Payload["ledger_transfer_id"] == "refund-"+ticket.TicketID {
+			foundRefundRef = true
+			require.Equal(t, "officer-1", event.Payload["principal_id"], "actor identity from verified claims")
+		}
+	}
+	require.True(t, foundRefundRef, "void event must carry the refund transfer reference")
+}
+
+// TestVoidBoardedTicketRejected: a boarding-consumed ticket can never be
+// voided (the FE-2 refund flow must not become a refund-after-boarding door).
+func TestVoidBoardedTicketRejected(t *testing.T) {
+	service, store, ledger := seededService(t)
+	ticket := seedSoldTicket(store, "ticket-boarded")
+	ticket.State = StateIssued
+	ticket.Version = 3
+	now := time.Now().UTC()
+	ticket.Embarked = true
+	ticket.BoardedAt = &now
+	store.tickets[ticket.TicketID] = ticket
+
+	_, err := service.Void(context.Background(), ticket.TicketID, "officer-1", "operator", "corr-void")
+	require.ErrorIs(t, err, ErrTicketBoarded)
+	require.Empty(t, ledger.refunded)
+}
+
+// TestVoidAboveThresholdRequiresSecondOfficer is the FE-7 regression:
+// single-role void of a sold ticket at or above the threshold (0 by default)
+// records a maker request and refuses; only a second, distinct officer can
+// confirm, exactly once.
+func TestVoidAboveThresholdRequiresSecondOfficer(t *testing.T) {
+	service, store, ledger := seededService(t) // default threshold 0: dual control on every sold void
+	ticket := seedSoldTicket(store, "ticket-dual")
+
+	// Maker: the first officer's void records the request and refuses.
+	_, err := service.Void(context.Background(), ticket.TicketID, "officer-1", "operator", "corr-void-1")
+	require.ErrorIs(t, err, ErrVoidApprovalRequired)
+	require.Empty(t, ledger.refunded, "no refund before checker confirmation")
+	approval, err := store.GetVoidApproval(context.Background(), ticket.TicketID)
+	require.NoError(t, err)
+	require.Equal(t, "officer-1", approval.RequestedBy)
+	require.Equal(t, ticket.FareNGNMinor, approval.AmountNGNMinor)
+	foundRequest := false
+	for _, event := range store.events {
+		if event.EventType == EventVoidApprovalRequested && event.Payload["principal_id"] == "officer-1" {
+			foundRequest = true
+		}
+	}
+	require.True(t, foundRequest, "the maker request is audited")
+
+	// The maker can never self-approve.
+	_, err = service.Void(context.Background(), ticket.TicketID, "officer-1", "operator", "corr-void-2")
+	require.ErrorIs(t, err, ErrVoidApprovalRequired)
+	require.Empty(t, ledger.refunded)
+
+	// Checker: a second, distinct officer confirms; the void refunds exactly once.
+	voided, err := service.Void(context.Background(), ticket.TicketID, "officer-2", "state-officer", "corr-void-3")
+	require.NoError(t, err)
+	require.Equal(t, StateVoid, voided.State)
+	require.Equal(t, []string{ticket.TicketID}, ledger.refunded)
+	_, err = store.GetVoidApproval(context.Background(), ticket.TicketID)
+	require.ErrorIs(t, err, ErrNotFound, "the approval is consumed by the confirming void")
+
+	// Terminal: no third void, no second refund.
+	_, err = service.Void(context.Background(), ticket.TicketID, "officer-3", "state-officer", "corr-void-4")
+	require.ErrorIs(t, err, ErrInvalidTransition)
+	require.Len(t, ledger.refunded, 1)
+}
+
+// TestVoidDualControlThresholdFailsClosed: a negative threshold is a
+// construction error, never a silent relaxation.
+func TestVoidDualControlThresholdFailsClosed(t *testing.T) {
+	_, err := NewService(newFakeStore(), &fakeLedger{}, testSalt, WithVoidDualControlThreshold(-1))
+	require.Error(t, err)
 }
