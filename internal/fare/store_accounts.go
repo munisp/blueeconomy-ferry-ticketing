@@ -47,6 +47,14 @@ func (store *PostgresStore) GetFareAccount(ctx context.Context, accountID string
 		`SELECT `+fareAccountColumns+` FROM fare_accounts WHERE account_id = $1`, accountID))
 }
 
+// GetFareAccountTx loads one account inside an existing transaction (used by
+// the best-fare guard, which must not take a second pool connection while
+// holding the advisory lock — that deadlocks under concurrency).
+func (store *PostgresStore) GetFareAccountTx(ctx context.Context, tx pgx.Tx, accountID string) (FareAccount, error) {
+	return scanFareAccount(tx.QueryRow(ctx,
+		`SELECT `+fareAccountColumns+` FROM fare_accounts WHERE account_id = $1`, accountID))
+}
+
 const fareAccountColumns = `account_id, owner_ref, owner_digest, status, concession_class, concession_reference,
 	autoload_enabled, autoload_threshold_minor, autoload_amount_minor, ledger_account_id,
 	cached_balance_minor, balance_as_of, version, created_at, updated_at`

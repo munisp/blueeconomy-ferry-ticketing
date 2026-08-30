@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ledger"
 	"github.com/munisp/blueeconomy-ferry-ticketing/internal/ticketing"
@@ -130,47 +131,75 @@ func (service *SettlementService) Subsidy(ctx context.Context, from, to time.Tim
 	return service.store.SubsidyReport(ctx, from, to)
 }
 
-// SettleBestFare implements the best-fare guarantee for one ISO week: when a
-// NETWORK WEEK pass would have been cheaper than the subject's accumulated
-// capped spend, the difference is credited back (account subjects: to the
-// fare account; ticket-only subjects: to passenger clearing). Exactly-once
-// per subject per period. Callable as a period-settlement job after the week
-// closes; lazy per-subject evaluation reuses the same path.
+// SettleBestFare implements the best-fare guarantee for one ISO week
+// (PRA-137, scope-aware): every WEEK accumulator scope with a matching WEEK
+// pass product yields a candidate guarantee — NETWORK spend vs the cheapest
+// NETWORK pass, ROUTE spend vs the cheapest WEEK pass scoped to that route.
+// The subject receives the single MOST FAVORABLE candidate (max adjustment)
+// — best-fare is one guarantee, never two payouts over the same money.
+// Exactly-once per subject per period (service guard + scope-keyed PK +
+// deterministic transfer ID). Callable as a period-settlement job after the
+// week closes; lazy per-subject evaluation reuses the same path.
 func (service *SettlementService) SettleBestFare(ctx context.Context, weekStart time.Time, correlationID string) (int, error) {
 	periodStart := WeekPeriodStart(weekStart)
-	product, err := service.store.CheapestNetworkWeekPass(ctx)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return 0, nil // no WEEK product: no guarantee to settle
-		}
-		return 0, err
-	}
 	accumulators, err := service.store.ListAccumulators(ctx, "WEEK", periodStart)
 	if err != nil {
 		return 0, err
 	}
-	settled := 0
+	// bestCandidate[subject] = the scope guarantee that pays the most.
+	type candidate struct {
+		accumulator Accumulator
+		product     PassProduct
+		adjustment  int64
+	}
+	best := map[string]candidate{}
 	for _, accumulator := range accumulators {
-		// NETWORK accumulators hold the subject's whole-week spend.
-		if accumulator.ScopeType != ScopeTypeNetwork || accumulator.SpentMinor <= product.PriceNGNMinor {
+		if accumulator.ScopeType != ScopeTypeNetwork && accumulator.ScopeType != ScopeTypeRoute {
 			continue
 		}
-		// Exactly-once guard BEFORE any money movement (the deterministic
-		// transfer ID is the cluster-side backstop, not the mechanism).
-		if exists, err := service.store.BestFareAdjustmentExists(ctx, accumulator.SubjectRef, periodStart); err != nil {
-			return settled, err
-		} else if exists {
-			continue
+		product, err := service.store.CheapestWeekPassForScope(ctx, accumulator.ScopeType, accumulator.ScopeRef)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue // no WEEK product covers this scope: no guarantee
+			}
+			return 0, err
 		}
 		adjustment := accumulator.SpentMinor - product.PriceNGNMinor
-		reference := fmt.Sprintf("bestfare:%s:%s", accumulator.SubjectRef, periodStart.Format("2006-01-02"))
-		transferID, err := service.creditBestFare(ctx, accumulator.SubjectRef, reference, adjustment)
-		if err != nil {
-			return settled, fmt.Errorf("settle best fare for %s: %w", accumulator.SubjectRef, err)
+		if adjustment <= 0 {
+			continue
 		}
-		created, err := service.store.InsertBestFareAdjustment(ctx, BestFareAdjustment{
+		if current, ok := best[accumulator.SubjectRef]; !ok || adjustment > current.adjustment {
+			best[accumulator.SubjectRef] = candidate{accumulator, product, adjustment}
+		}
+	}
+	settled := 0
+	for _, winner := range best {
+		// Serialize per subject: guard lock + exists-check, then credit, then
+		// record — one critical section (the deterministic transfer ID is the
+		// cluster-side backstop, not the mechanism).
+		guard, exists, err := service.store.BeginBestFareGuard(ctx, winner.accumulator.SubjectRef, periodStart)
+		if err != nil {
+			return settled, err
+		}
+		if exists {
+			guard.Rollback(ctx)
+			continue
+		}
+		reference := fmt.Sprintf("bestfare:%s:%s:%s:%s", winner.accumulator.SubjectRef,
+			periodStart.Format("2006-01-02"), winner.accumulator.ScopeType, winner.accumulator.ScopeRef)
+		transferID, err := service.creditBestFare(ctx, guard, winner.accumulator.SubjectRef, reference, winner.adjustment)
+		if err != nil {
+			guard.Rollback(ctx)
+			return settled, fmt.Errorf("settle best fare for %s: %w", winner.accumulator.SubjectRef, err)
+		}
+		product := winner.product
+		accumulator := winner.accumulator
+		adjustment := winner.adjustment
+		created, err := service.store.InsertBestFareAdjustmentTx(ctx, guard, BestFareAdjustment{
 			SubjectRef:       accumulator.SubjectRef,
 			PeriodStart:      periodStart,
+			ScopeType:        accumulator.ScopeType,
+			ScopeRef:         accumulator.ScopeRef,
 			ProductID:        product.ProductID,
 			SpentMinor:       accumulator.SpentMinor,
 			PassPriceMinor:   product.PriceNGNMinor,
@@ -202,25 +231,19 @@ func (service *SettlementService) SettleBestFare(ctx context.Context, weekStart 
 	return settled, nil
 }
 
-// creditBestFare moves the adjustment: account subjects are refunded to
-// their fare account (and the read-model cache follows); ticket-only
-// subjects are refunded to passenger clearing.
-func (service *SettlementService) creditBestFare(ctx context.Context, subjectRef, reference string, adjustment int64) (string, error) {
-	account, err := service.store.GetFareAccount(ctx, subjectRef)
+// creditBestFare moves the adjustment inside the guard transaction: account
+// subjects are refunded to their fare account (read-model cache follows in
+// the same tx); ticket-only subjects are refunded to passenger clearing.
+// All PG work rides the guard tx — never a second pool connection while the
+// advisory lock is held.
+func (service *SettlementService) creditBestFare(ctx context.Context, tx pgx.Tx, subjectRef, reference string, adjustment int64) (string, error) {
+	account, err := service.store.GetFareAccountTx(ctx, tx, subjectRef)
 	if err == nil {
 		transferID, err := service.accounts.RefundToAccount(ctx, reference, account.LedgerAccountID, adjustment)
 		if err != nil {
 			return "", err
 		}
-		tx, err := service.store.Pool().Begin(ctx)
-		if err != nil {
-			return "", err
-		}
-		defer tx.Rollback(ctx)
 		if err := service.store.AdjustCachedBalance(ctx, tx, subjectRef, adjustment); err != nil {
-			return "", err
-		}
-		if err := tx.Commit(ctx); err != nil {
 			return "", err
 		}
 		return transferID, nil

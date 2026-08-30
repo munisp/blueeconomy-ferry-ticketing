@@ -209,10 +209,13 @@ func (store *PostgresStore) SubsidyReport(ctx context.Context, from, to time.Tim
 	return lines, rows.Err()
 }
 
-// BestFareAdjustment is one weekly best-fare settlement record.
+// BestFareAdjustment is one weekly best-fare settlement record, attributed
+// to the accumulator scope whose guarantee paid (PRA-137).
 type BestFareAdjustment struct {
 	SubjectRef       string
 	PeriodStart      time.Time
+	ScopeType        string
+	ScopeRef         string
 	ProductID        string
 	SpentMinor       int64
 	PassPriceMinor   int64
@@ -220,7 +223,9 @@ type BestFareAdjustment struct {
 	LedgerTransferID string
 }
 
-// BestFareAdjustmentExists reports whether the subject's period was settled.
+// BestFareAdjustmentExists reports whether the subject's period was settled
+// under ANY scope: at most one best-fare payout per subject per week (the
+// single most favorable guarantee), never two payouts over the same money.
 func (store *PostgresStore) BestFareAdjustmentExists(ctx context.Context, subjectRef string, periodStart time.Time) (bool, error) {
 	var exists bool
 	if err := store.pool.QueryRow(ctx,
@@ -231,19 +236,44 @@ func (store *PostgresStore) BestFareAdjustmentExists(ctx context.Context, subjec
 	return exists, nil
 }
 
-// InsertBestFareAdjustment records one adjustment with its audit event;
-// created is false when the subject's period was already settled.
-func (store *PostgresStore) InsertBestFareAdjustment(ctx context.Context, adjustment BestFareAdjustment, event ticketing.Event) (created bool, err error) {
+// BeginBestFareGuard opens one transaction holding a per-subject-period
+// advisory lock: concurrent settlement runs for the same subject serialize
+// here, so the exists-check, the ledger credit and the record insert are one
+// serialized critical section (exactly-once even before the deterministic
+// transfer ID backstop).
+func (store *PostgresStore) BeginBestFareGuard(ctx context.Context, subjectRef string, periodStart time.Time) (pgx.Tx, bool, error) {
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("begin best-fare transaction: %w", err)
+		return nil, false, fmt.Errorf("begin best-fare guard: %w", err)
 	}
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1))`,
+		"bestfare:"+subjectRef+"|"+periodStart.Format("2006-01-02")); err != nil {
+		tx.Rollback(ctx)
+		return nil, false, fmt.Errorf("lock best-fare subject: %w", err)
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM best_fare_adjustments WHERE subject_ref = $1 AND period_start = $2)`,
+		subjectRef, periodStart).Scan(&exists); err != nil {
+		tx.Rollback(ctx)
+		return nil, false, fmt.Errorf("check best-fare adjustment: %w", err)
+	}
+	return tx, exists, nil
+}
+
+// InsertBestFareAdjustmentTx records the adjustment with its audit event
+// inside the guard transaction and commits it; created is false when a
+// serialized twin already recorded the scope-period.
+func (store *PostgresStore) InsertBestFareAdjustmentTx(ctx context.Context, tx pgx.Tx, adjustment BestFareAdjustment, event ticketing.Event) (created bool, err error) {
 	defer tx.Rollback(ctx)
 	result, err := tx.Exec(ctx,
-		`INSERT INTO best_fare_adjustments (subject_ref, period_start, product_id, spent_minor, pass_price_minor,
-		     adjustment_minor, ledger_transfer_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (subject_ref, period_start) DO NOTHING`,
-		adjustment.SubjectRef, adjustment.PeriodStart, adjustment.ProductID, adjustment.SpentMinor,
+		`INSERT INTO best_fare_adjustments (subject_ref, period_start, scope_type, scope_ref, product_id,
+		     spent_minor, pass_price_minor, adjustment_minor, ledger_transfer_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (subject_ref, period_start, scope_type, scope_ref) DO NOTHING`,
+		adjustment.SubjectRef, adjustment.PeriodStart, adjustment.ScopeType, adjustment.ScopeRef,
+		adjustment.ProductID, adjustment.SpentMinor,
 		adjustment.PassPriceMinor, adjustment.AdjustmentMinor, adjustment.LedgerTransferID)
 	if err != nil {
 		return false, fmt.Errorf("insert best-fare adjustment: %w", err)
@@ -260,26 +290,32 @@ func (store *PostgresStore) InsertBestFareAdjustment(ctx context.Context, adjust
 	return true, nil
 }
 
-// CheapestNetworkWeekPass finds the cheapest active NETWORK WEEK product
-// (best-fare guarantee baseline). Scope-aware best-fare (route products) is
-// a later refinement; the guarantee is documented as network-scope.
-func (store *PostgresStore) CheapestNetworkWeekPass(ctx context.Context) (PassProduct, error) {
+// CheapestWeekPassForScope finds the cheapest active WEEK product covering
+// one accumulator scope (PRA-137): NETWORK accumulators compare against the
+// cheapest NETWORK pass; ROUTE accumulators against the cheapest WEEK pass
+// scoped to that exact route. ErrNotFound when no product covers the scope.
+func (store *PostgresStore) CheapestWeekPassForScope(ctx context.Context, scopeType, scopeRef string) (PassProduct, error) {
 	var product PassProduct
 	var operatorID *string
 	err := store.pool.QueryRow(ctx,
 		`SELECT product_id, kind, scope_type, scope_ref, price_ngn_minor, operator_id, active, created_at
-		 FROM pass_products WHERE active AND kind = 'WEEK' AND scope_type = 'NETWORK'
-		 ORDER BY price_ngn_minor LIMIT 1`).
+		 FROM pass_products WHERE active AND kind = 'WEEK' AND scope_type = $1 AND scope_ref = $2
+		 ORDER BY price_ngn_minor LIMIT 1`, scopeType, scopeRef).
 		Scan(&product.ProductID, &product.Kind, &product.ScopeType, &product.ScopeRef, &product.PriceNGNMinor,
 			&operatorID, &product.Active, &product.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return PassProduct{}, ErrNotFound
 		}
-		return PassProduct{}, fmt.Errorf("find cheapest week pass: %w", err)
+		return PassProduct{}, fmt.Errorf("find cheapest week pass for %s/%s: %w", scopeType, scopeRef, err)
 	}
 	if operatorID != nil {
 		product.OperatorID = *operatorID
 	}
 	return product, nil
+}
+
+// CheapestNetworkWeekPass finds the cheapest active NETWORK WEEK product.
+func (store *PostgresStore) CheapestNetworkWeekPass(ctx context.Context) (PassProduct, error) {
+	return store.CheapestWeekPassForScope(ctx, ScopeTypeNetwork, "")
 }
