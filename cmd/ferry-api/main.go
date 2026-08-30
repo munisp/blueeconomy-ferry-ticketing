@@ -218,6 +218,16 @@ func configureBlueFare(ctx context.Context, cfg config.Config, pool *pgxpool.Poo
 	if err != nil {
 		return err
 	}
+	// PRA-134: live bank-rail adapters (Mojaloop FSPIOP / NIP reference
+	// credit). Empty env = no adapters, and rail-channel top-ups fail closed
+	// at request time; partial env fails boot (never a synthetic rail).
+	rails, err := fare.LoadRailsFromEnv()
+	if err != nil {
+		return fmt.Errorf("load bank rails: %w", err)
+	}
+	if err := accountService.WithRails(rails); err != nil {
+		return err
+	}
 	// Conductor batches verify ticket artifacts for authenticity at the scan
 	// instant (the rotating window code is an online-gate-only check).
 	boardingVerifier, err := ticketproofVerifier(boarding)

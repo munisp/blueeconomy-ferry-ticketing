@@ -51,6 +51,7 @@ const (
 	EventFareAccountOpened    = "ferry.fare.account_opened"
 	EventInstrumentRegistered = "ferry.fare.instrument_registered"
 	EventTopUpInitiated       = "ferry.fare.topup_initiated"
+	EventTopUpRailAccepted    = "ferry.fare.topup_rail_accepted"
 	EventTopUpCredited        = "ferry.fare.topup_credited"
 	EventTopUpFailed          = "ferry.fare.topup_failed"
 

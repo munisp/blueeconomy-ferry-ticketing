@@ -240,6 +240,29 @@ type fareFixture struct {
 	journeys    *JourneyService
 	accountSvc  *AccountService
 	settlement  *SettlementService
+	rails       *scriptedRails
+}
+
+// scriptedRails is the TEST-ONLY rail bundle (never on production paths —
+// production adapters are the real Mojaloop/NIP clients behind env config).
+// It records initiations so tests can assert the rail leg happened.
+type scriptedRails struct {
+	mu          sync.Mutex
+	initiations []RailInstruction
+	failNext    bool
+}
+
+func (rails *scriptedRails) client() RailClient { return rails }
+
+func (rails *scriptedRails) Initiate(_ context.Context, instruction RailInstruction) (RailInitiation, error) {
+	rails.mu.Lock()
+	defer rails.mu.Unlock()
+	if rails.failNext {
+		rails.failNext = false
+		return RailInitiation{}, errors.New("scripted rail failure")
+	}
+	rails.initiations = append(rails.initiations, instruction)
+	return RailInitiation{ExternalRef: "test-rail:" + instruction.Reference}, nil
 }
 
 const testSalt = "fare-integration-salt-0123456789abcdef"
@@ -270,11 +293,15 @@ func newFareFixture(t *testing.T) fareFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rails := &scriptedRails{}
+	if err := accountSvc.WithRails(Rails{TopUpMojaloop: rails, TopUpNIPTransfer: rails}); err != nil {
+		t.Fatal(err)
+	}
 	settlement, err := NewSettlementService(store, tickets, accounts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fareFixture{pool, store, ticketStore, tickets, accounts, passes, journeys, accountSvc, settlement}
+	return fareFixture{pool, store, ticketStore, tickets, accounts, passes, journeys, accountSvc, settlement, rails}
 }
 
 func (fixture fareFixture) close() { fixture.pool.Close() }

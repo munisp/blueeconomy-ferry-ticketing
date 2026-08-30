@@ -26,6 +26,7 @@ type AccountService struct {
 	accounts  AccountLedger
 	salt      string
 	webhookHMAC string
+	rails       Rails
 	now       func() time.Time
 }
 
@@ -44,7 +45,22 @@ func NewAccountService(store *PostgresStore, accounts AccountLedger, manifestSal
 		return nil, errors.New("rail webhook HMAC secret of at least 16 characters is required (fail-closed)")
 	}
 	return &AccountService{store: store, accounts: accounts, salt: manifestSalt, webhookHMAC: webhookHMACSecret,
-		now: func() time.Time { return time.Now().UTC() }}, nil
+		rails: Rails{}, now: func() time.Time { return time.Now().UTC() }}, nil
+}
+
+// WithRails wires the live bank-rail adapters (PRA-134). Channels without a
+// configured adapter fail closed at top-up time with ErrRailNotConfigured.
+func (service *AccountService) WithRails(rails Rails) error {
+	for channel, rail := range rails {
+		if channel != TopUpMojaloop && channel != TopUpNIPTransfer {
+			return fmt.Errorf("rail adapter for unsupported channel %q", channel)
+		}
+		if rail == nil {
+			return fmt.Errorf("rail adapter for %s is nil (fail-closed)", channel)
+		}
+	}
+	service.rails = rails
+	return nil
 }
 
 // OpenAccount provisions the ledger account (no-negative constraint) and
@@ -233,12 +249,51 @@ func (service *AccountService) TopUp(ctx context.Context, request TopUpRequest) 
 			return TopUp{}, err
 		}
 		return topup, nil
-	case TopUpMojaloop, TopUpNIPTransfer, TopUpNQR, TopUpUSSD:
-		// Honest pending-credit: the rail must confirm. NIP uses the unique
-		// reference as the transfer narration; NQR encodes it in the EMV
-		// payload; Mojaloop binds it to the quote; USSD reads it to the
-		// session. Cross-service rail wiring is a later wave — this service
-		// owns the state machine and the verification boundary.
+	case TopUpMojaloop, TopUpNIPTransfer:
+		// PRA-134: live rail initiation. The adapter is mandatory (fail
+		// closed when unconfigured — never a synthetic rail). The top-up is
+		// durable PENDING first; initiation binds the rail's acceptance
+		// reference; credit still happens only on the verified webhook.
+		rail, ok := service.rails[request.Channel]
+		if !ok || rail == nil {
+			return TopUp{}, ErrRailNotConfigured
+		}
+		topup.State = TopUpPending
+		if err := service.store.InsertTopUp(ctx, topup, service.event(EventTopUpInitiated, topup.TopUpID, request.CorrelationID, map[string]any{
+			"topup_id":         topup.TopUpID,
+			"account_id":       topup.AccountID,
+			"channel":          topup.Channel,
+			"reference":        topup.Reference,
+			"amount_ngn_minor": topup.AmountNGNMinor,
+			"principal_id":     request.Principal,
+			"state":            TopUpPending,
+		})); err != nil {
+			return TopUp{}, err
+		}
+		initiation, err := rail.Initiate(ctx, RailInstruction{
+			Reference: topup.Reference, AmountNGNMinor: topup.AmountNGNMinor, Narration: topup.Reference,
+		})
+		if err != nil {
+			// Honest failure: the durable record shows the rail refused.
+			_ = service.store.FailTopUp(ctx, topup.TopUpID, "", "rail initiation failed: "+err.Error(),
+				service.event(EventTopUpFailed, topup.TopUpID, request.CorrelationID, map[string]any{
+					"topup_id": topup.TopUpID, "channel": topup.Channel, "reference": topup.Reference,
+					"reason": "rail_initiation_failed",
+				}))
+			return TopUp{}, fmt.Errorf("initiate %s rail transfer: %w", request.Channel, err)
+		}
+		if err := service.store.RecordRailInitiation(ctx, topup.TopUpID, initiation.ExternalRef,
+			service.event(EventTopUpRailAccepted, topup.TopUpID, request.CorrelationID, map[string]any{
+				"topup_id": topup.TopUpID, "channel": topup.Channel, "reference": topup.Reference,
+				"external_ref": initiation.ExternalRef, "state": TopUpPending,
+			})); err != nil {
+			return TopUp{}, err
+		}
+		return service.store.GetTopUp(ctx, topup.TopUpID)
+	case TopUpNQR, TopUpUSSD:
+		// Payer-initiated channels: the payer scans the NQR payload or the
+		// USSD session quotes the reference; there is no outbound rail call.
+		// Honest pending-credit: credit only on the verified rail webhook.
 		topup.State = TopUpPending
 		if err := service.store.InsertTopUp(ctx, topup, service.event(EventTopUpInitiated, topup.TopUpID, request.CorrelationID, map[string]any{
 			"topup_id":         topup.TopUpID,

@@ -310,6 +310,30 @@ func (store *PostgresStore) ClaimTapCounter(ctx context.Context, tokenRef string
 	return tag.RowsAffected() == 1, nil
 }
 
+// RecordRailInitiation binds the rail's acceptance reference to a PENDING
+// top-up (PRA-134) with its audit event. The top-up stays PENDING: an
+// accepted initiation is a promise, never a credit.
+func (store *PostgresStore) RecordRailInitiation(ctx context.Context, topupID, externalRef string, event ticketing.Event) error {
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin rail initiation transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx,
+		`UPDATE topups SET external_ref = $2, version = version + 1
+		 WHERE topup_id = $1 AND state = $3`, topupID, externalRef, TopUpPending)
+	if err != nil {
+		return fmt.Errorf("record rail initiation: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("top-up %s is not PENDING: %w", topupID, ErrInvalidTransition)
+	}
+	if err := insertEventTx(ctx, tx, event); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ComputeAccountFlows sums the account's recorded movements.
 func (store *PostgresStore) ComputeAccountFlows(ctx context.Context, accountID string) (AccountFlowTotals, error) {
 	var totals AccountFlowTotals
