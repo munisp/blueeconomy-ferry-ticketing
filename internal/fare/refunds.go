@@ -88,9 +88,10 @@ func (service *AccountService) RequestAccountRefund(ctx context.Context, request
 }
 
 // ApproveAccountRefund applies the checker decision and settles through the
-// ledger in one saga step. Self-approval fails closed (SQL four-eyes).
-// Approval of an already-approved refund re-attempts settlement (the ledger
-// transfer ID is deterministic — the re-attempt is a no-op cluster-side);
+// ledger inside ONE advisory-locked transaction per refund: concurrent
+// checkers serialize, the ledger leg executes at most once (deterministic
+// transfer ID as backstop), and self-approval fails closed (SQL four-eyes).
+// Approval of an already-APPROVED refund is the crash-recovery settle retry;
 // approval of a SETTLED refund replays the stored record.
 func (service *AccountService) ApproveAccountRefund(ctx context.Context, refundID, checker, correlationID string) (AccountRefund, error) {
 	ctx, span := tracer().Start(ctx, "fare.account_refund.approve")
@@ -98,39 +99,32 @@ func (service *AccountService) ApproveAccountRefund(ctx context.Context, refundI
 	if strings.TrimSpace(checker) == "" {
 		return AccountRefund{}, errors.New("checker is required")
 	}
-	stored, err := service.store.GetAccountRefund(ctx, refundID)
+	guard, refund, err := service.store.BeginAccountRefundGuard(ctx, refundID)
 	if err != nil {
 		return AccountRefund{}, err
 	}
-	switch stored.State {
+	defer guard.Rollback(ctx)
+	switch refund.State {
 	case RefundSettled:
-		return stored, nil
+		return refund, nil
 	case RefundRejected:
 		return AccountRefund{}, fmt.Errorf("refund %s is REJECTED: %w", refundID, ErrInvalidTransition)
 	case RefundApproved:
-		// Settle retry (crash recovery or a replayed approval).
-		return service.settleAccountRefund(ctx, stored, correlationID)
+		// Crash-recovery settle retry inside the guard.
+	default: // REQUESTED
+		refund, err = service.store.TransitionAccountRefundTx(ctx, guard, refund, RefundApproved, checker,
+			service.event(EventAccountRefundApproved, refundID, correlationID, map[string]any{
+				"refund_id":  refundID,
+				"account_id": refund.AccountID,
+				"maker":      refund.Maker,
+				"checker":    checker,
+				"state":      RefundApproved,
+			}))
+		if err != nil {
+			return AccountRefund{}, err
+		}
 	}
-	refund, err := service.store.transitionAccountRefund(ctx, refundID, RefundRequested, RefundApproved, checker,
-		service.event(EventAccountRefundApproved, refundID, correlationID, map[string]any{
-			"refund_id":  refundID,
-			"account_id": stored.AccountID,
-			"maker":      stored.Maker,
-			"checker":    checker,
-			"state":      RefundApproved,
-		}))
-	if err != nil {
-		return AccountRefund{}, err
-	}
-	return service.settleAccountRefund(ctx, refund, correlationID)
-}
-
-// settleAccountRefund moves value exactly once against the ledger, then
-// records settlement. The deterministic transfer ID (refund_id) makes the
-// ledger leg idempotent; the version-gated PG update makes the record leg
-// replay-safe.
-func (service *AccountService) settleAccountRefund(ctx context.Context, refund AccountRefund, correlationID string) (AccountRefund, error) {
-	account, err := service.store.GetFareAccount(ctx, refund.AccountID)
+	account, err := service.store.GetFareAccountTx(ctx, guard, refund.AccountID)
 	if err != nil {
 		return AccountRefund{}, err
 	}
@@ -138,7 +132,7 @@ func (service *AccountService) settleAccountRefund(ctx context.Context, refund A
 	if err != nil {
 		return AccountRefund{}, fmt.Errorf("settle account refund on ledger: %w", err)
 	}
-	settled, err := service.store.MarkAccountRefundSettled(ctx, refund, transferID,
+	if _, err := service.store.MarkAccountRefundSettledTx(ctx, guard, refund, transferID,
 		service.event(EventAccountRefundSettled, refund.RefundID, correlationID, map[string]any{
 			"refund_id":          refund.RefundID,
 			"account_id":         refund.AccountID,
@@ -147,35 +141,42 @@ func (service *AccountService) settleAccountRefund(ctx context.Context, refund A
 			"checker":            refund.Checker,
 			"ledger_transfer_id": transferID,
 			"state":              RefundSettled,
-		}))
-	if err != nil {
+		})); err != nil {
 		return AccountRefund{}, err
 	}
-	if !settled {
-		// A concurrent twin settled first; its record is authoritative.
-		return service.store.GetAccountRefund(ctx, refund.RefundID)
+	if err := guard.Commit(ctx); err != nil {
+		return AccountRefund{}, fmt.Errorf("commit refund settle: %w", err)
 	}
-	return service.store.GetAccountRefund(ctx, refund.RefundID)
+	return service.store.GetAccountRefund(ctx, refundID)
 }
 
-// RejectAccountRefund records the checker rejection (four-eyes in SQL).
+// RejectAccountRefund records the checker rejection (four-eyes in SQL,
+// serialized through the same guard as approvals).
 func (service *AccountService) RejectAccountRefund(ctx context.Context, refundID, checker, correlationID string) (AccountRefund, error) {
 	if strings.TrimSpace(checker) == "" {
 		return AccountRefund{}, errors.New("checker is required")
 	}
-	stored, err := service.store.GetAccountRefund(ctx, refundID)
+	guard, refund, err := service.store.BeginAccountRefundGuard(ctx, refundID)
 	if err != nil {
 		return AccountRefund{}, err
 	}
-	if stored.State != RefundRequested {
-		return AccountRefund{}, fmt.Errorf("refund %s is %s: %w", refundID, stored.State, ErrInvalidTransition)
+	defer guard.Rollback(ctx)
+	if refund.State != RefundRequested {
+		return AccountRefund{}, fmt.Errorf("refund %s is %s: %w", refundID, refund.State, ErrInvalidTransition)
 	}
-	return service.store.transitionAccountRefund(ctx, refundID, RefundRequested, RefundRejected, checker,
+	rejected, err := service.store.TransitionAccountRefundTx(ctx, guard, refund, RefundRejected, checker,
 		service.event(EventAccountRefundRejected, refundID, correlationID, map[string]any{
 			"refund_id":  refundID,
-			"account_id": stored.AccountID,
-			"maker":      stored.Maker,
+			"account_id": refund.AccountID,
+			"maker":      refund.Maker,
 			"checker":    checker,
 			"state":      RefundRejected,
 		}))
+	if err != nil {
+		return AccountRefund{}, err
+	}
+	if err := guard.Commit(ctx); err != nil {
+		return AccountRefund{}, fmt.Errorf("commit refund rejection: %w", err)
+	}
+	return rejected, nil
 }
