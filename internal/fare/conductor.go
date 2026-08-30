@@ -198,6 +198,8 @@ func (service *ConductorService) processScan(ctx context.Context, request BatchR
 		record, err = service.processPassScan(ctx, request, scan, record)
 	case "ACCOUNT_DEBIT":
 		record, err = service.processOfflineDebit(ctx, request, scan, record)
+	case "NFC_TAP":
+		record, err = service.processTapScan(ctx, request, scan, record)
 	default:
 		record.Result = ScanDenied
 		record.DenyReason = "unknown_artifact_kind"
@@ -311,6 +313,54 @@ func (service *ConductorService) processPassScan(ctx context.Context, request Ba
 // per-device caps and the account's ledger balance. Over-cap scans route to
 // REVIEW (no settlement); cluster-declined debits are the liability-queue
 // DECLINED outcome (Advisory §9.5: the government's loss, made visible).
+// processTapScan handles one NFC tap upload (PRA-133): parse the TLV
+// payload, verify the instrument signature against the enrolled Ed25519 key
+// (the same check the device ran offline), spend the monotonic tap counter
+// (anti-replay), then settle through the identical capped offline-debit
+// path (per-tx/daily caps, settle-on-reconnect, decline liability).
+func (service *ConductorService) processTapScan(ctx context.Context, request BatchRequest, scan BatchScan, record ConductorScan) (ConductorScan, error) {
+	payload, err := ParseTapPayload(scan.Artifact)
+	if err != nil {
+		record.Result = ScanDenied
+		record.DenyReason = "malformed_tap"
+		return record, nil
+	}
+	instrument, err := service.store.GetInstrumentByToken(ctx, payload.TokenRef)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			record.Result = ScanDenied
+			record.DenyReason = "unknown_instrument"
+			return record, nil
+		}
+		return record, err
+	}
+	if instrument.Kind != "NFC_TAP" || instrument.Status != "ACTIVE" || instrument.PublicKeyHex == "" {
+		record.Result = ScanDenied
+		record.DenyReason = "instrument_not_tap_enrolled"
+		return record, nil
+	}
+	if err := VerifyTapSignature(instrument.PublicKeyHex, payload); err != nil {
+		record.Result = ScanDenied
+		record.DenyReason = "invalid_tap_signature"
+		return record, nil
+	}
+	claimed, err := service.store.ClaimTapCounter(ctx, payload.TokenRef, payload.Counter)
+	if err != nil {
+		return record, err
+	}
+	if !claimed {
+		record.Result = ScanDenied
+		record.DenyReason = "tap_replayed"
+		return record, nil
+	}
+	// Verified tap: settle as a capped offline debit (same money semantics).
+	debitScan := scan
+	debitScan.Artifact = payload.TokenRef
+	debitScan.AmountNGNMinor = payload.AmountMinor
+	debitScan.ScannedAt = payload.TappedAt
+	return service.processOfflineDebit(ctx, request, debitScan, record)
+}
+
 func (service *ConductorService) processOfflineDebit(ctx context.Context, request BatchRequest, scan BatchScan, record ConductorScan) (ConductorScan, error) {
 	// Offline-debit settlement span: cap check + ledger debit as one traced
 	// unit (Advisory §9.5 outcomes are attributes, never swallowed).

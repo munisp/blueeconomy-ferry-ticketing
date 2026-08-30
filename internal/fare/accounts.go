@@ -2,6 +2,7 @@ package fare
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -102,6 +103,7 @@ func (service *AccountService) RegisterInstrument(ctx context.Context, accountID
 	default:
 		return Instrument{}, fmt.Errorf("instrument kind %q is not supported", kind)
 	}
+
 	if strings.TrimSpace(tokenRef) == "" || len(tokenRef) > 256 {
 		return Instrument{}, errors.New("instrument token reference is required")
 	}
@@ -116,6 +118,42 @@ func (service *AccountService) RegisterInstrument(ctx context.Context, accountID
 		"instrument_id": instrument.InstrumentID,
 		"account_id":    accountID,
 		"kind":          kind,
+		"principal_id":  principal,
+	})); err != nil {
+		return Instrument{}, err
+	}
+	return instrument, nil
+}
+
+
+// RegisterTapInstrument enrolls one NFC tap instrument (PRA-133): the
+// Ed25519 public key is the offline verification anchor for conductor
+// devices, and the instrument starts at tap counter zero. Enrollment is the
+// conductor-device linkage: the tap is only settleable through devices
+// provisioned in the offline-cap registry (device_offline_caps).
+func (service *AccountService) RegisterTapInstrument(ctx context.Context, accountID, tokenRef, publicKeyHex, principal, correlationID string) (Instrument, error) {
+	if _, err := service.store.GetFareAccount(ctx, accountID); err != nil {
+		return Instrument{}, err
+	}
+	if strings.TrimSpace(tokenRef) == "" || len(tokenRef) > 256 {
+		return Instrument{}, errors.New("instrument token reference is required")
+	}
+	publicKey, err := hex.DecodeString(strings.TrimSpace(publicKeyHex))
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		return Instrument{}, errors.New("a valid Ed25519 public key (hex) is required for tap enrollment")
+	}
+	instrument := Instrument{
+		InstrumentID: uuid.NewString(),
+		AccountID:    accountID,
+		Kind:         "NFC_TAP",
+		TokenRef:     tokenRef,
+		Status:       "ACTIVE",
+		PublicKeyHex: strings.ToLower(strings.TrimSpace(publicKeyHex)),
+	}
+	if err := service.store.RegisterInstrument(ctx, instrument, service.event(EventInstrumentRegistered, instrument.InstrumentID, correlationID, map[string]any{
+		"instrument_id": instrument.InstrumentID,
+		"account_id":    accountID,
+		"kind":          instrument.Kind,
 		"principal_id":  principal,
 	})); err != nil {
 		return Instrument{}, err

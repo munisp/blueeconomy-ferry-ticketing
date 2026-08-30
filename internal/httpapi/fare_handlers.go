@@ -71,6 +71,7 @@ func (server *Server) RegisterFareRoutes(authenticator auth.Authenticator, route
 		RolePassenger, RoleAgentCashier, RoleOperator, RoleNIWAOfficer, RoleStateOfficer,
 		RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleFMMBEOversight))
 	server.mux.Handle("POST /v1/fare/accounts/{id}/instruments", protected(http.HandlerFunc(server.registerInstrument), RolePassenger, RoleAgentCashier, RoleOperator))
+	server.mux.Handle("POST /v1/fare/accounts/{id}/tap-instruments", protected(http.HandlerFunc(server.registerTapInstrument), RolePassenger, RoleAgentCashier, RoleOperator))
 	server.mux.Handle("POST /v1/fare/accounts/{id}/topups", protected(http.HandlerFunc(server.topUpAccount), RolePassenger, RoleAgentCashier, RoleOperator))
 	server.mux.Handle("GET /v1/fare/accounts/{id}/topups/{topupId}", protected(http.HandlerFunc(server.getTopUp),
 		RolePassenger, RoleAgentCashier, RoleOperator, RoleStateOfficer, RoleIndependentAuditor, RoleAuditor))
@@ -512,6 +513,34 @@ func (server *Server) registerInstrument(writer http.ResponseWriter, request *ht
 	}
 	instrument, err := server.fare.Accounts.RegisterInstrument(request.Context(), accountID,
 		strings.ToUpper(body.Kind), body.TokenRef, resolved.Subject, correlationID(request))
+	if err != nil {
+		writeFareError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, instrument)
+}
+
+type tapInstrumentBody struct {
+	TokenRef     string `json:"tokenRef"`
+	PublicKeyHex string `json:"publicKeyHex"`
+}
+
+// registerTapInstrument enrolls one NFC tap instrument (PRA-133).
+func (server *Server) registerTapInstrument(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	accountID := request.PathValue("id")
+	if _, ok := server.accountReadable(writer, request, accountID); !ok {
+		return
+	}
+	var body tapInstrumentBody
+	if !decodeBody(writer, request, &body) {
+		return
+	}
+	instrument, err := server.fare.Accounts.RegisterTapInstrument(request.Context(), accountID,
+		body.TokenRef, body.PublicKeyHex, resolved.Subject, correlationID(request))
 	if err != nil {
 		writeFareError(writer, err)
 		return

@@ -86,9 +86,10 @@ func (store *PostgresStore) RegisterInstrument(ctx context.Context, instrument I
 	}
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO instruments (instrument_id, account_id, kind, token_ref, status)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		instrument.InstrumentID, instrument.AccountID, instrument.Kind, instrument.TokenRef, instrument.Status); err != nil {
+		`INSERT INTO instruments (instrument_id, account_id, kind, token_ref, status, public_key_hex)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		instrument.InstrumentID, instrument.AccountID, instrument.Kind, instrument.TokenRef, instrument.Status,
+		instrument.PublicKeyHex); err != nil {
 		return fmt.Errorf("insert instrument: %w", err)
 	}
 	if err := insertEventTx(ctx, tx, event); err != nil {
@@ -272,6 +273,41 @@ type AccountFlowTotals struct {
 	RefundedMinor     int64
 	JourneyMinor      int64
 	OfflineDebitMinor int64
+}
+
+// GetInstrumentByToken loads one instrument by its presented token.
+func (store *PostgresStore) GetInstrumentByToken(ctx context.Context, tokenRef string) (Instrument, error) {
+	var instrument Instrument
+	var publicKey *string
+	err := store.pool.QueryRow(ctx,
+		`SELECT instrument_id, account_id, kind, token_ref, status, public_key_hex, tap_counter, created_at
+		 FROM instruments WHERE token_ref = $1`, tokenRef).
+		Scan(&instrument.InstrumentID, &instrument.AccountID, &instrument.Kind, &instrument.TokenRef,
+			&instrument.Status, &publicKey, &instrument.TapCounter, &instrument.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Instrument{}, ErrNotFound
+		}
+		return Instrument{}, fmt.Errorf("load instrument: %w", err)
+	}
+	if publicKey != nil {
+		instrument.PublicKeyHex = *publicKey
+	}
+	return instrument, nil
+}
+
+// ClaimTapCounter spends one monotonic tap counter (PRA-133 anti-replay):
+// the update only lands while the stored counter is lower, so a cloned
+// payload with a consumed counter can never settle twice. Returns false
+// when the counter was already spent.
+func (store *PostgresStore) ClaimTapCounter(ctx context.Context, tokenRef string, counter uint64) (bool, error) {
+	tag, err := store.pool.Exec(ctx,
+		`UPDATE instruments SET tap_counter = $2 WHERE token_ref = $1 AND tap_counter < $2`,
+		tokenRef, counter)
+	if err != nil {
+		return false, fmt.Errorf("claim tap counter: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // ComputeAccountFlows sums the account's recorded movements.

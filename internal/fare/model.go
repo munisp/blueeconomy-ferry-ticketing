@@ -283,6 +283,8 @@ type Instrument struct {
 	Kind         string
 	TokenRef     string
 	Status       string
+	PublicKeyHex string // NFC_TAP enrollment key (Ed25519, hex)
+	TapCounter   uint64 // monotonic anti-replay counter
 	CreatedAt    time.Time
 }
 
