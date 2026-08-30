@@ -261,6 +261,7 @@ func (store *PostgresStore) FailTopUp(ctx context.Context, topupID, externalRef,
 // debits), compared against the cached balance.
 type AccountFlowTotals struct {
 	CreditedMinor     int64
+	RefundedMinor     int64
 	JourneyMinor      int64
 	OfflineDebitMinor int64
 }
@@ -282,6 +283,11 @@ func (store *PostgresStore) ComputeAccountFlows(ctx context.Context, accountID s
 		`SELECT COALESCE(SUM(amount_ngn_minor), 0) FROM offline_debits WHERE account_id = $1 AND state = $2`,
 		accountID, DebitSettled).Scan(&totals.OfflineDebitMinor); err != nil {
 		return totals, fmt.Errorf("sum offline debits: %w", err)
+	}
+	if err := store.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount_minor), 0) FROM fare_account_refunds WHERE account_id = $1 AND state = $2`,
+		accountID, RefundSettled).Scan(&totals.RefundedMinor); err != nil {
+		return totals, fmt.Errorf("sum account refunds: %w", err)
 	}
 	return totals, nil
 }

@@ -79,6 +79,11 @@ func (server *Server) RegisterFareRoutes(authenticator auth.Authenticator, route
 	// tokens. Signature verification inside the handler fails closed.
 	server.mux.HandleFunc("POST /v1/fare/topups/webhook", server.railWebhook)
 
+	server.mux.Handle("POST /v1/fare/accounts/{id}/refunds", protected(http.HandlerFunc(server.requestAccountRefund), RoleOperator, RoleStateOfficer, RoleAgentCashier))
+	server.mux.Handle("POST /v1/fare/refunds/{refundId}/approve", protected(http.HandlerFunc(server.approveAccountRefund), RoleOperator, RoleStateOfficer))
+	server.mux.Handle("POST /v1/fare/refunds/{refundId}/reject", protected(http.HandlerFunc(server.rejectAccountRefund), RoleOperator, RoleStateOfficer))
+	server.mux.Handle("GET /v1/fare/refunds/{refundId}", protected(http.HandlerFunc(server.getAccountRefund), RoleOperator, RoleStateOfficer, RolePassenger, RoleAgentCashier))
+
 	server.mux.Handle("POST /v1/fare/conductor/batches", protected(http.HandlerFunc(server.submitConductorBatch), RoleConductor))
 	server.mux.Handle("GET /v1/fare/conductor/batches/{deviceId}/{batchId}", protected(http.HandlerFunc(server.getConductorBatch), RoleConductor, RoleOperator, RoleStateOfficer))
 
@@ -108,6 +113,8 @@ func writeFareError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusConflict, "state transition is not permitted")
 	case errors.Is(err, fare.ErrAccountNotActive):
 		writeError(writer, http.StatusConflict, "fare account is not active")
+	case errors.Is(err, fare.ErrMakerChecker):
+		writeError(writer, http.StatusConflict, "maker and checker must be distinct")
 	case errors.Is(err, fare.ErrWebhookSignature):
 		writeError(writer, http.StatusUnauthorized, "webhook signature is invalid")
 	default:
@@ -590,6 +597,89 @@ func (server *Server) getTopUpNQR(writer http.ResponseWriter, request *http.Requ
 
 // railWebhook receives verified rail callbacks (HMAC-authenticated, not
 // JWT): the ONLY path that credits rail-channel top-ups.
+// ---------------------------------------------------------------------------
+// Account refunds (PRA-136): maker requests, distinct checker approves or
+// rejects, settlement moves value to the fare account exactly once.
+// ---------------------------------------------------------------------------
+
+type accountRefundBody struct {
+	AmountMinor int64  `json:"amountNgnMinor"`
+	Reason      string `json:"reason"`
+}
+
+func (server *Server) requestAccountRefund(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	accountID := request.PathValue("id")
+	if _, ok := server.accountReadable(writer, request, accountID); !ok {
+		return
+	}
+	var body accountRefundBody
+	if !decodeBody(writer, request, &body) {
+		return
+	}
+	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+	if idempotencyKey == "" {
+		writeError(writer, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	refund, err := server.fare.Accounts.RequestAccountRefund(request.Context(), fare.AccountRefundRequest{
+		AccountID:      accountID,
+		AmountMinor:    body.AmountMinor,
+		Reason:         body.Reason,
+		IdempotencyKey: idempotencyKey,
+		CorrelationID:  correlationID(request),
+		Principal:      resolved.Subject,
+	})
+	if err != nil {
+		writeFareError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, refund)
+}
+
+func (server *Server) approveAccountRefund(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	refund, err := server.fare.Accounts.ApproveAccountRefund(request.Context(),
+		request.PathValue("refundId"), resolved.Subject, correlationID(request))
+	if err != nil {
+		writeFareError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, refund)
+}
+
+func (server *Server) rejectAccountRefund(writer http.ResponseWriter, request *http.Request) {
+	resolved, ok := principal(writer, request)
+	if !ok {
+		return
+	}
+	refund, err := server.fare.Accounts.RejectAccountRefund(request.Context(),
+		request.PathValue("refundId"), resolved.Subject, correlationID(request))
+	if err != nil {
+		writeFareError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, refund)
+}
+
+func (server *Server) getAccountRefund(writer http.ResponseWriter, request *http.Request) {
+	if _, ok := principal(writer, request); !ok {
+		return
+	}
+	refund, err := server.fare.Store.GetAccountRefund(request.Context(), request.PathValue("refundId"))
+	if err != nil {
+		writeFareError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, refund)
+}
+
 func (server *Server) railWebhook(writer http.ResponseWriter, request *http.Request) {
 	raw, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, 1<<20))
 	if err != nil {

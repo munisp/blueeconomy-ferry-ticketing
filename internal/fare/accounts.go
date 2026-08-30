@@ -311,12 +311,13 @@ func (service *AccountService) HandleRailWebhook(ctx context.Context, webhook Ra
 }
 
 // AccountView is the account plus its reconciliation read-model: the cached
-// balance versus the flow-computed balance (credited top-ups minus charged
-// journeys and settled offline debits). Drift here is a reconciliation
-// signal; the TigerBeetle balance is authoritative.
+// balance versus the flow-computed balance (credited top-ups plus settled
+// refunds minus charged journeys and settled offline debits). Drift here is
+// a reconciliation signal; the TigerBeetle balance is authoritative.
 type AccountView struct {
 	Account          FareAccount `json:"account"`
 	CreditedMinor    int64       `json:"creditedNgnMinor"`
+	RefundedMinor    int64       `json:"refundedNgnMinor"`
 	JourneyMinor     int64       `json:"journeyChargesNgnMinor"`
 	OfflineDebitMinor int64      `json:"offlineDebitsNgnMinor"`
 	FlowBalanceMinor int64       `json:"flowBalanceNgnMinor"`
@@ -334,10 +335,11 @@ func (service *AccountService) GetAccountView(ctx context.Context, accountID str
 	if err != nil {
 		return AccountView{}, err
 	}
-	flowBalance := flows.CreditedMinor - flows.JourneyMinor - flows.OfflineDebitMinor
+	flowBalance := flows.CreditedMinor + flows.RefundedMinor - flows.JourneyMinor - flows.OfflineDebitMinor
 	return AccountView{
 		Account:            account,
 		CreditedMinor:      flows.CreditedMinor,
+		RefundedMinor:      flows.RefundedMinor,
 		JourneyMinor:       flows.JourneyMinor,
 		OfflineDebitMinor:  flows.OfflineDebitMinor,
 		FlowBalanceMinor:   flowBalance,

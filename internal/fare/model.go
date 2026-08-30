@@ -59,6 +59,11 @@ const (
 
 	EventConductorBatchProcessed = "ferry.conductor.batch_processed"
 	EventSettlementRunCompleted  = "ferry.fare.settlement_run_completed"
+
+	EventAccountRefundRequested = "ferry.fare.account_refund_requested"
+	EventAccountRefundApproved  = "ferry.fare.account_refund_approved"
+	EventAccountRefundSettled   = "ferry.fare.account_refund_settled"
+	EventAccountRefundRejected  = "ferry.fare.account_refund_rejected"
 )
 
 var (
@@ -78,6 +83,8 @@ var (
 	ErrWebhookSignature = errors.New("rail webhook signature is invalid")
 	// ErrAccountNotActive rejects money movement on suspended/closed accounts.
 	ErrAccountNotActive = errors.New("fare account is not active")
+	// ErrMakerChecker rejects self-approval (four-eyes, fail closed).
+	ErrMakerChecker = errors.New("maker and checker must be distinct")
 )
 
 // Pass kinds and their rolling validity durations (Venice-style 24h windows,
@@ -295,6 +302,34 @@ type TopUp struct {
 	Version          int64
 	CreatedAt        time.Time
 	CreditedAt       *time.Time
+}
+
+// Account refund saga states (PRA-136): maker requests, a DISTINCT checker
+// approves or rejects, settlement moves value from operator revenue to the
+// fare account exactly once (deterministic ledger transfer ID).
+const (
+	RefundRequested = "REQUESTED"
+	RefundApproved  = "APPROVED"
+	RefundSettled   = "SETTLED"
+	RefundRejected  = "REJECTED"
+)
+
+// AccountRefund is one refund-to-account saga record.
+type AccountRefund struct {
+	RefundID         string     `json:"refundId"`
+	AccountID        string     `json:"accountId"`
+	AmountMinor      int64      `json:"amountNgnMinor"`
+	Reason           string     `json:"reason"`
+	IdempotencyKey   string     `json:"idempotencyKey"`
+	State            string     `json:"state"`
+	Maker            string     `json:"maker"`
+	Checker          string     `json:"checker,omitempty"`
+	LedgerTransferID string     `json:"ledgerTransferId,omitempty"`
+	Version          int64      `json:"version"`
+	CorrelationID    string     `json:"correlationId"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	DecidedAt        *time.Time `json:"decidedAt,omitempty"`
+	SettledAt        *time.Time `json:"settledAt,omitempty"`
 }
 
 // ValidationDecision is the ADMIT/DENY result of pass validation. Reason is
