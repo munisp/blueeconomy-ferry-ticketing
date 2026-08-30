@@ -1,7 +1,6 @@
 package fare
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +31,7 @@ func TestDeviceRegistryClientAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
+	ctx := tracedContext()
 	verdict, err := directory.Lookup(ctx, "device-1")
 	if err != nil {
 		t.Fatal(err)
