@@ -67,7 +67,13 @@ type ConductorService struct {
 	verifier    *ticketproof.Verifier
 	validation  *ValidationService
 	accounts    AccountLedger
+	devices     *DeviceDirectory
 	now         func() time.Time
+}
+
+// WithDeviceDirectory wires the geo device-registry directory (PRA-135).
+func (service *ConductorService) WithDeviceDirectory(directory *DeviceDirectory) {
+	service.devices = directory
 }
 
 // NewConductorService fails closed on any missing dependency.
@@ -371,6 +377,23 @@ func (service *ConductorService) processOfflineDebit(ctx context.Context, reques
 			attribute.Int64("ferry.amount_ngn_minor", scan.AmountNGNMinor),
 		))
 	defer span.End()
+	// PRA-135: the geo device registry is authoritative for lifecycle when
+	// wired and fresh (a SUSPENDED device is denied even with local caps);
+	// a stale/unreachable registry falls back to the local fail-closed
+	// plane below — explicit, never silent.
+	if service.devices != nil {
+		verdict, err := service.devices.Lookup(ctx, request.DeviceID)
+		if err != nil {
+			record.Result = ScanDenied
+			record.DenyReason = "device_registry_unreachable"
+			return record, nil
+		}
+		if !verdict.Stale && verdict.Device.Status != "ACTIVE" {
+			record.Result = ScanDenied
+			record.DenyReason = "device_" + strings.ToLower(verdict.Device.Status)
+			return record, nil
+		}
+	}
 	caps, err := service.store.GetDeviceCaps(ctx, request.DeviceID)
 	if err != nil {
 		if errors.Is(err, ErrDeviceNotProvisioned) {

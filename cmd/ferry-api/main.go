@@ -238,6 +238,15 @@ func configureBlueFare(ctx context.Context, cfg config.Config, pool *pgxpool.Poo
 	if err != nil {
 		return err
 	}
+	// PRA-135: geo device-registry lifecycle wiring. Empty env = local-only
+	// fail-closed device plane (as before); partial env fails boot.
+	deviceDirectory, err := fare.LoadDeviceDirectoryFromEnv()
+	if err != nil {
+		return fmt.Errorf("load device registry directory: %w", err)
+	}
+	if deviceDirectory != nil {
+		conductorService.WithDeviceDirectory(deviceDirectory)
+	}
 	settlementService, err := fare.NewSettlementService(fareStore, ledgerService, ledgerService)
 	if err != nil {
 		return err
