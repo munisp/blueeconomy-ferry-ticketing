@@ -33,8 +33,8 @@ import (
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -243,6 +243,13 @@ func (telemetry *Telemetry) Enabled() bool {
 // otherwise the explicit no-op tracer.
 func (telemetry *Telemetry) Tracer() trace.Tracer {
 	return telemetry.tracer
+}
+
+// Meter returns a meter on the service meter pipeline (exported through the
+// local Prometheus endpoint), for non-HTTP components such as the met-ocean
+// bridge consumer.
+func (telemetry *Telemetry) Meter() metric.Meter {
+	return telemetry.meterProvider.Meter(telemetry.config.ServiceName)
 }
 
 // MetricsHandler serves the Prometheus scrape endpoint.
