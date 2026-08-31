@@ -161,7 +161,9 @@ func LoadDirectory(path string) (*Directory, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("key directory path is required")
 	}
-	info, err := os.Stat(path)
+	// Lstat, not Stat: a symlinked directory file is not a regular file and
+	// fails closed (docs/envelope-signature.md §3).
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat key directory: %w", err)
 	}

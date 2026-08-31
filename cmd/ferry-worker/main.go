@@ -214,14 +214,24 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	advisoryActs := advisoryActivities(store)
+	advisoryDefinition, err := ferryworkflow.NewRouteAdvisoryWorkflow(advisoryActs)
+	if err != nil {
+		return err
+	}
+
 	temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{
 		Interceptors: []interceptor.WorkerInterceptor{tracingInterceptor},
 	})
 	temporalWorker.RegisterWorkflowWithOptions(definition.FerryTicketWorkflow, sdkworkflow.RegisterOptions{Name: "FerryTicketWorkflow"})
+	temporalWorker.RegisterWorkflowWithOptions(advisoryDefinition.RouteAdvisoryWorkflow, sdkworkflow.RegisterOptions{Name: ferryworkflow.RouteAdvisoryWorkflowName})
 	temporalWorker.RegisterActivityWithOptions(activities.PauseBoarding, activity.RegisterOptions{Name: ferryworkflow.ActivityPauseBoarding})
 	temporalWorker.RegisterActivityWithOptions(activities.MarkTripDeparted, activity.RegisterOptions{Name: ferryworkflow.ActivityMarkTripDeparted})
 	temporalWorker.RegisterActivityWithOptions(activities.EmitWeatherAlert, activity.RegisterOptions{Name: ferryworkflow.ActivityEmitWeatherAlert})
 	temporalWorker.RegisterActivityWithOptions(activities.RecordManifestIncomplete, activity.RegisterOptions{Name: ferryworkflow.ActivityRecordManifestIncomplete})
+	temporalWorker.RegisterActivityWithOptions(advisoryActs.ListAffectedDepartures, activity.RegisterOptions{Name: ferryworkflow.ActivityListAffectedDepartures})
+	temporalWorker.RegisterActivityWithOptions(advisoryActs.SuspendDeparture, activity.RegisterOptions{Name: ferryworkflow.ActivitySuspendDeparture})
+	temporalWorker.RegisterActivityWithOptions(advisoryActs.ResumeAdvisoryDepartures, activity.RegisterOptions{Name: ferryworkflow.ActivityResumeAdvisoryDepartures})
 
 	logger.Info("ferry-worker starting", "task_queue", taskQueue, "namespace", temporalNamespace)
 	errCh := make(chan error, 1)
@@ -235,6 +245,73 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("run temporal worker: %w", err)
 		}
 		return nil
+	}
+}
+
+// advisoryActivities binds the RouteAdvisoryWorkflow activities to the
+// PostgreSQL store: open-departure lookup, transactional suspension (state
+// transition + audit record + passenger-notification outbox entry) and
+// idempotent resumption.
+func advisoryActivities(store *ticketing.PostgresStore) *ferryworkflow.AdvisoryActivities {
+	return &ferryworkflow.AdvisoryActivities{
+		ListAffectedDepartures: func(ctx context.Context, routeReference string, from, until time.Time) ([]ferryworkflow.DepartureWindow, error) {
+			trips, err := store.ListOpenDeparturesInWindow(ctx, routeReference, from, until)
+			if err != nil {
+				return nil, err
+			}
+			departures := make([]ferryworkflow.DepartureWindow, 0, len(trips))
+			for _, trip := range trips {
+				departures = append(departures, ferryworkflow.DepartureWindow{
+					TripID:             trip.TripID,
+					ScheduledDeparture: trip.ScheduledDeparture,
+					Status:             trip.Status,
+				})
+			}
+			return departures, nil
+		},
+		SuspendDeparture: func(ctx context.Context, tripID string, detail ferryworkflow.SuspensionDetail, correlationID string) (bool, error) {
+			return store.SuspendDeparture(ctx, ticketing.TripSuspension{
+				TripID:            tripID,
+				AdvisoryID:        detail.AdvisoryID,
+				Severity:          detail.Severity,
+				PhenomenonCode:    detail.PhenomenonCode,
+				ZoneID:            detail.ZoneID,
+				EffectiveFrom:     detail.EffectiveFrom,
+				EffectiveUntil:    detail.EffectiveUntil,
+				BulletinReference: detail.BulletinReference,
+			}, correlationID, ticketing.Event{
+				EventID:       uuid.NewString(),
+				Topic:         ticketing.TopicNotifications,
+				SubjectID:     tripID,
+				EventType:     ticketing.EventDepartureSuspended,
+				CorrelationID: correlationID,
+				Payload: map[string]any{
+					"trip_id":            tripID,
+					"advisory_id":        detail.AdvisoryID,
+					"severity":           detail.Severity,
+					"phenomenon_code":    detail.PhenomenonCode,
+					"zone_id":            detail.ZoneID,
+					"effective_from":     detail.EffectiveFrom.UTC().Format(time.RFC3339),
+					"effective_until":    detail.EffectiveUntil.UTC().Format(time.RFC3339),
+					"bulletin_reference": detail.BulletinReference,
+				},
+			})
+		},
+		ResumeAdvisoryDepartures: func(ctx context.Context, advisoryID, correlationID string) ([]string, error) {
+			return store.ResumeDeparturesForAdvisory(ctx, advisoryID, correlationID, func(tripID string) ticketing.Event {
+				return ticketing.Event{
+					EventID:       uuid.NewString(),
+					Topic:         ticketing.TopicNotifications,
+					SubjectID:     tripID,
+					EventType:     ticketing.EventDepartureResumed,
+					CorrelationID: correlationID,
+					Payload: map[string]any{
+						"trip_id":     tripID,
+						"advisory_id": advisoryID,
+					},
+				}
+			})
+		},
 	}
 }
 
