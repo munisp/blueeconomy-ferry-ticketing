@@ -74,9 +74,11 @@ type Provenance struct {
 
 // topics is the topic allowlist; anything else fails closed.
 var topics = map[string]struct{}{
-	"ferries.ticketing.v1": {},
-	"ferries.manifest.v1":  {},
-	"ferries.fare.v1":      {},
+	"ferries.ticketing.v1":     {},
+	"ferries.manifest.v1":      {},
+	"ferries.notifications.v1": {},
+	"ferries.fare.v1":          {},
+
 }
 
 // envelopeEventTypes maps internal outbox event types to envelope event types.
@@ -92,6 +94,10 @@ var envelopeEventTypes = map[string]string{
 	"ferry.manifest.exported":       "ferries.manifest.submitted.v1",
 	"ferry.manifest.incomplete":     "ferries.manifest.incomplete.v1",
 	"ferry.adverse_weather.alerted": "ferries.manifest.adverse_weather.v1",
+	// Passenger notifications from the met-ocean bridge (advisory-driven
+	// departure suspensions and resumptions).
+	"ferry.trip.departure_suspended": "ferries.notifications.departure_suspended.v1",
+	"ferry.trip.departure_resumed":   "ferries.notifications.departure_resumed.v1",
 	// Fraud telemetry consumed by the security-operations engine.
 	"ferry.ticket.verification_failed":    "ferries.ticketing.ticket_verification_failed.v1",
 	"ferry.ticket.duplicate_presentation": "ferries.ticketing.ticket_duplicate_presentation.v1",
