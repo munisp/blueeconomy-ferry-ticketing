@@ -1,0 +1,48 @@
+{
+  "envelopeVersion": "1.0",
+  "eventId": "evt-metocean-000001",
+  "eventType": "waterways.met_ocean.advisory.v1",
+  "occurredAt": "2026-08-29T14:00:00Z",
+  "producer": "blueeconomy-waterway-safety",
+  "correlationId": "corr-metocean-000001",
+  "fhir": {
+    "resourceType": "Bundle",
+    "type": "message",
+    "bundleId": "bdl-metocean-000001",
+    "entry": [
+      {
+        "fullUrl": "urn:uuid:275ce85a-35f4-5aee-8c00-85f3fdfeb6c4",
+        "resource": {
+          "@type": "type.googleapis.com/blueeconomy.contracts.v1.MetoceanAdvisoryIssued",
+          "advisoryId": "moa-2026-000123",
+          "sender": "blueeconomy-waterway-safety",
+          "msgType": "Alert",
+          "category": "Met",
+          "phenomenonCode": "HIGH_SIGNIFICANT_WAVE_HEIGHT",
+          "urgency": "Expected",
+          "severity": "Severe",
+          "certainty": "Likely",
+          "zoneId": "hz-lagos-approach",
+          "effectiveFrom": "2026-08-29T18:00:00Z",
+          "onset": "2026-08-29T21:00:00Z",
+          "effectiveUntil": "2026-08-30T06:00:00Z",
+          "bulletinReference": "sha256:80faeff2091c6124316781628f4373945947f4d780bf70d8db4a8f88292671aa",
+          "referencesAdvisoryId": "",
+          "source": "FEED",
+          "feedKind": "OPEN_METEO_MARINE",
+          "attributionText": "Weather data by Open-Meteo.com",
+          "status": "ACTIVE",
+          "policyDigestSha256": "sha256:58b9bae826346f394dec6b7e630e701af9c87ffb82d22bbb8a441846b011167a",
+          "issuedAt": "2026-08-29T14:00:00Z"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "principalId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "principalRole": "metocean-producer",
+    "ledgerCommitHash": "",
+    "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6ImJsdWVlY29ub215LXdhdGVyd2F5LXNhZmV0eS0wIn0.eyJjbGFzc2lmaWNhdGlvbiI6IklOVEVSTkFMIiwiY29ycmVsYXRpb25JZCI6ImNvcnItbWV0b2NlYW4tMDAwMDAxIiwiZW52ZWxvcGVWZXJzaW9uIjoiMS4wIiwiZXZlbnRJZCI6ImV2dC1tZXRvY2Vhbi0wMDAwMDEiLCJldmVudFR5cGUiOiJ3YXRlcndheXMubWV0X29jZWFuLmFkdmlzb3J5LnYxIiwiZmhpciI6eyJidW5kbGVJZCI6ImJkbC1tZXRvY2Vhbi0wMDAwMDEiLCJlbnRyeSI6W3siZnVsbFVybCI6InVybjp1dWlkOjI3NWNlODVhLTM1ZjQtNWFlZS04YzAwLTg1ZjNmZGZlYjZjNCIsInJlc291cmNlIjp7IkB0eXBlIjoidHlwZS5nb29nbGVhcGlzLmNvbS9ibHVlZWNvbm9teS5jb250cmFjdHMudjEuTWV0b2NlYW5BZHZpc29yeUlzc3VlZCIsImFkdmlzb3J5SWQiOiJtb2EtMjAyNi0wMDAxMjMiLCJhdHRyaWJ1dGlvblRleHQiOiJXZWF0aGVyIGRhdGEgYnkgT3Blbi1NZXRlby5jb20iLCJidWxsZXRpblJlZmVyZW5jZSI6InNoYTI1Njo4MGZhZWZmMjA5MWM2MTI0MzE2NzgxNjI4ZjQzNzM5NDU5NDdmNGQ3ODBiZjcwZDhkYjRhOGY4ODI5MjY3MWFhIiwiY2F0ZWdvcnkiOiJNZXQiLCJjZXJ0YWludHkiOiJMaWtlbHkiLCJlZmZlY3RpdmVGcm9tIjoiMjAyNi0wOC0yOVQxODowMDowMFoiLCJlZmZlY3RpdmVVbnRpbCI6IjIwMjYtMDgtMzBUMDY6MDA6MDBaIiwiZmVlZEtpbmQiOiJPUEVOX01FVEVPX01BUklORSIsImlzc3VlZEF0IjoiMjAyNi0wOC0yOVQxNDowMDowMFoiLCJtc2dUeXBlIjoiQWxlcnQiLCJvbnNldCI6IjIwMjYtMDgtMjlUMjE6MDA6MDBaIiwicGhlbm9tZW5vbkNvZGUiOiJISUdIX1NJR05JRklDQU5UX1dBVkVfSEVJR0hUIiwicG9saWN5RGlnZXN0U2hhMjU2Ijoic2hhMjU2OjU4YjliYWU4MjYzNDZmMzk0ZGVjNmI3ZTYzMGU3MDFhZjljODdmZmI4MmQyMmJiYjhhNDQxODQ2YjAxMTE2N2EiLCJyZWZlcmVuY2VzQWR2aXNvcnlJZCI6IiIsInNlbmRlciI6ImJsdWVlY29ub215LXdhdGVyd2F5LXNhZmV0eSIsInNldmVyaXR5IjoiU2V2ZXJlIiwic291cmNlIjoiRkVFRCIsInN0YXR1cyI6IkFDVElWRSIsInVyZ2VuY3kiOiJFeHBlY3RlZCIsInpvbmVJZCI6Imh6LWxhZ29zLWFwcHJvYWNoIn19XSwicmVzb3VyY2VUeXBlIjoiQnVuZGxlIiwidHlwZSI6Im1lc3NhZ2UifSwib2NjdXJyZWRBdCI6IjIwMjYtMDgtMjlUMTQ6MDA6MDBaIiwicHJvZHVjZXIiOiJibHVlZWNvbm9teS13YXRlcndheS1zYWZldHkiLCJwcm92ZW5hbmNlIjp7ImxlZGdlckNvbW1pdEhhc2giOiIiLCJwcmluY2lwYWxJZCI6ImY0N2FjMTBiLTU4Y2MtNDM3Mi1hNTY3LTBlMDJiMmMzZDQ3OSIsInByaW5jaXBhbFJvbGUiOiJtZXRvY2Vhbi1wcm9kdWNlciJ9fQ.bbwo_5G1nbdB-vb2gNn11wpJhSMzIbT27XbZjoNlBQgKWFSwhd62lX9Ho9JYf_x1V8rpI5t6Oewi8d7dPIJvAA"
+  },
+  "classification": "INTERNAL"
+}

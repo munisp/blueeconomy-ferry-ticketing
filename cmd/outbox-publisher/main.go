@@ -1,7 +1,8 @@
 // outbox-publisher drains the ferry transactional outbox to the
-// ferries.ticketing.v1 and ferries.manifest.v1 Kafka topics with the platform
-// FHIR-aligned envelope. It is at-least-once with idempotent keys and fails
-// closed when Kafka or PostgreSQL is unavailable.
+// ferries.ticketing.v1, ferries.manifest.v1, ferries.notifications.v1 and
+// ferries.fare.v1 Kafka topics with the platform FHIR-aligned envelope. It
+// is at-least-once with idempotent keys and fails closed when Kafka or
+// PostgreSQL is unavailable.
 package main
 
 import (
@@ -75,9 +76,9 @@ func run() error {
 		return fmt.Errorf("ping postgres: %w", err)
 	}
 
-	producers := make([]*outbox.KafkaProducer, 0, 2)
+	producers := make([]*outbox.KafkaProducer, 0, 4)
 	router := outbox.MapRouter{}
-	for _, topic := range []string{ticketing.TopicTicketing, ticketing.TopicManifest, fare.TopicFare} {
+	for _, topic := range []string{ticketing.TopicTicketing, ticketing.TopicManifest, ticketing.TopicNotifications, fare.TopicFare} {
 		producer, err := outbox.NewKafkaProducer(brokers, topic)
 		if err != nil {
 			return err

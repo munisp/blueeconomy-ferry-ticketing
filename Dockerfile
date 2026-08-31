@@ -25,3 +25,8 @@ FROM gcr.io/distroless/base-debian12:nonroot AS outbox-publisher
 COPY --from=build /out/outbox-publisher /outbox-publisher
 USER nonroot:nonroot
 ENTRYPOINT ["/outbox-publisher"]
+
+FROM gcr.io/distroless/base-debian12:nonroot AS metocean-bridge
+COPY --from=build /out/metocean-bridge /metocean-bridge
+USER nonroot:nonroot
+ENTRYPOINT ["/metocean-bridge"]
