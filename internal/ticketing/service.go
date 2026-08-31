@@ -44,6 +44,9 @@ type Event struct {
 const (
 	TopicTicketing = "ferries.ticketing.v1"
 	TopicManifest  = "ferries.manifest.v1"
+	// TopicNotifications carries passenger-notification outbox entries
+	// (advisory-driven departure suspensions and resumptions).
+	TopicNotifications = "ferries.notifications.v1"
 )
 
 // Outbox event types produced by this service.
@@ -64,6 +67,12 @@ const (
 	// EventManifestIncomplete audits a departure without a manifest.
 	EventManifestIncomplete = "ferry.manifest.incomplete"
 	EventAdverseWeather     = "ferry.adverse_weather.alerted"
+	// EventDepartureSuspended notifies passengers that a met-ocean advisory
+	// suspended the departure (with the audit trail in trip_suspensions).
+	EventDepartureSuspended = "ferry.trip.departure_suspended"
+	// EventDepartureResumed notifies passengers that the advisory ended
+	// (cancel or window expiry) and the departure is reinstated.
+	EventDepartureResumed = "ferry.trip.departure_resumed"
 )
 
 // ReserveStatus is the reconciled state of a pending ledger reserve, resolved
