@@ -119,6 +119,14 @@ func (server *Server) routes(authenticator auth.Authenticator) {
 	server.mux.Handle("GET /v1/tickets/{id}", protected(http.HandlerFunc(server.getTicket),
 		RolePassenger, RoleAgentCashier, RoleOperator, RoleNIWAOfficer, RoleStateOfficer,
 		RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleFMMBEOversight))
+	server.mux.Handle("GET /v1/tickets/{id}/artifact", protected(http.HandlerFunc(server.ticketArtifact),
+		RolePassenger, RoleAgentCashier, RoleOperator, RoleNIWAOfficer, RoleStateOfficer,
+		RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleFMMBEOversight))
+	server.mux.Handle("GET /v1/tickets/verification-keys", protected(http.HandlerFunc(server.verificationKeys),
+		RolePassenger, RoleAgentCashier, RoleOperator, RoleNIWAOfficer, RoleStateOfficer,
+		RoleNIMASAObserver, RoleIndependentAuditor, RoleAuditor, RoleFMMBEOversight))
+	server.mux.Handle("POST /v1/tickets/verify", protected(http.HandlerFunc(server.verifyTicketScan),
+		RoleOperator, RoleAgentCashier, RoleNIWAOfficer, RoleStateOfficer))
 	server.mux.Handle("POST /v1/tickets/{id}/refund", protected(http.HandlerFunc(server.refundTicket), RolePassenger, RoleOperator))
 	server.mux.Handle("POST /v1/tickets/{id}/void", protected(http.HandlerFunc(server.voidTicket), RoleOperator, RoleStateOfficer))
 
